@@ -1,0 +1,5 @@
+﻿# Ignorar arquivos sensíveis e temporários
+.env
+__pycache__/
+*.pyc
+leads.csv
