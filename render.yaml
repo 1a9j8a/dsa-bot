@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: dsa-bot-1
+    env: python
+    plan: pro
+    region: oregon
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health       # <── ESTA LINHA AQUI
