@@ -3,3 +3,5 @@
 __pycache__/
 *.pyc
 leads.csv
+
+env.txt

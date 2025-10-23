@@ -1,21 +1,26 @@
-# DSA Bot (WhatsApp + Z-API)
+# 🤖 DSA Bot – Spark (Assistente da DSA Cristal Química)
 
-Assistente da **DSA Cristal Química** feito em FastAPI, integrado à **Z-API** para receber e enviar mensagens do WhatsApp.
+Chatbot em **FastAPI** integrado à **Z-API** para WhatsApp.  
+Fluxos prontos:
+- Menu do **Spark** (saudação personalizada)
+- **Produtos Rezymol** (itens separados)
+- **Linha Pitty**
+- **Catálogo** (envio de PDF/URL)
+- **Atendente humano** (captura de lead)
+- **Compra** (Nome, Empresa, CNPJ, Cidade, CEP, e-mail)
 
-## Como funciona
-- Webhook: `POST /api/webhook/receber`
-- Healthcheck: `GET /health`
-- Fluxos:
-  - Menu de boas-vindas
-  - Captura de lead (nome → empresa → cidade) salvo em `leads.csv`
-  - Envio de catálogos (Rezymol / Pitty) por link ou arquivo (se configurado)
+---
 
-## Variáveis de ambiente (NÃO comitar)
-```env
-ZAPI_BASE=https://api.z-api.io
-ZAPI_INSTANCE_ID=SEU_ID
-ZAPI_TOKEN=SEU_TOKEN
-ZAPI_CLIENT_TOKEN=SEU_CLIENT_TOKEN
-# opcionais (links públicos dos PDFs)
-CATALOG_REZYMOL_URL=https://seu-link-publico.pdf
-CATALOG_PITTY_URL=https://seu-link-publico.pdf
+## 💾 Requisitos
+- Python 3.11+
+- Conta na Z-API (Instance ID, Token, Client-Token)
+- (Opcional) Links públicos dos catálogos (Google Drive “qualquer pessoa com o link → Visualizador”)
+
+---
+
+## ⚙️ Configuração local (1 minuto)
+
+```bash
+git clone https://github.com/1a9j8a/dsa-bot.git
+cd dsa-bot
+pip install -r requirements.txt
