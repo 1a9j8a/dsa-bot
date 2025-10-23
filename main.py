@@ -222,12 +222,83 @@ async def receber(request: Request):
         .strip()
     )
 
+    # ===== Extração ROBUSTA do TEXTO =====
     text = ""
-    for k in ("message", "body", "text", "content"):
-        v = data.get(k)
-        if isinstance(v, str) and v.strip():
-            text = v.strip()
+
+    # 1) caminhos diretos + aninhados comuns (Z-API)
+    candidates = [
+        ("message",),
+        ("body",),
+        ("text",),
+        ("content",),
+
+        # aninhados
+        ("text", "message"),
+        ("text", "text"),
+        ("textMessageData", "textMessage"),
+        ("extendedTextMessageData", "text"),
+        ("messageData", "textMessageData", "textMessage"),
+        ("messageData", "extendedTextMessageData", "text"),
+        ("messages", 0, "text"),
+        ("messages", 0, "body"),
+        ("messages", 0, "message"),
+        ("messages", 0, "content"),
+    ]
+
+    # 2) variações em PT
+    candidates += [
+        ("texto",),
+        ("conteudo",),
+        ("texto", "mensagem"),
+        ("mensagem",),
+    ]
+
+    def pick(d, path):
+        cur = d
+        for key in path:
+            if isinstance(key, int):
+                if isinstance(cur, list) and len(cur) > key:
+                    cur = cur[key]
+                else:
+                    return None
+            else:
+                if isinstance(cur, dict) and key in cur:
+                    cur = cur.get(key)
+                else:
+                    return None
+        return cur if isinstance(cur, str) and cur.strip() else None
+
+    for path in candidates:
+        val = pick(data, path)
+        if val:
+            text = val.strip()
             break
+
+    # 3) fallback: varre todo o dict procurando o primeiro valor string não vazio
+    if not text and isinstance(data, dict):
+        stack, seen = [data], set()
+        while stack:
+            node = stack.pop()
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+
+            if isinstance(node, dict):
+                for v in node.values():
+                    if isinstance(v, str) and v.strip():
+                        text = v.strip()
+                        stack.clear()
+                        break
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+            elif isinstance(node, list):
+                for v in node:
+                    if isinstance(v, str) and v.strip():
+                        text = v.strip()
+                        stack.clear()
+                        break
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
 
     print("==> MSG DE:", phone, "| TEXTO:", text)
 
