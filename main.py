@@ -1,5 +1,7 @@
 import os
 import csv
+import re
+from datetime import datetime
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -60,6 +62,33 @@ WELCOME = (
 )
 
 # ==============================
+# FUNÇÕES AUXILIARES
+# ==============================
+def generate_order_code(phone: str) -> str:
+    """Gera um código único para o pedido com base no telefone e data."""
+    date_str = datetime.now().strftime("%Y%m%d")
+    short_phone = phone[-4:] if phone else "0000"
+    return f"PED-{short_phone}-{date_str}-{str(len(SESSIONS) + 1).zfill(3)}"
+
+
+def save_lead(data: dict, phone: str, mode: str = "atendimento"):
+    file_exists = LEADS_CSV.exists()
+    with LEADS_CSV.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["telefone", "nome", "empresa", "cnpj", "cidade", "cep", "email", "modo"])
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            "telefone": phone,
+            "nome": data.get("nome", ""),
+            "empresa": data.get("empresa", ""),
+            "cnpj": data.get("cnpj", ""),
+            "cidade": data.get("cidade", ""),
+            "cep": data.get("cep", ""),
+            "email": data.get("email", ""),
+            "modo": mode
+        })
+
+# ==============================
 # CAPTURA DE LEADS E COMPRAS
 # ==============================
 def start_lead_capture(phone: str, mode: str = "atendimento"):
@@ -76,6 +105,27 @@ def continue_lead_capture(phone: str, text: str):
     stage = session.get("stage")
     mode = session.get("mode", "atendimento")
 
+    # Expressões para detectar dados automaticamente
+    cnpj_re = re.compile(r"\b\d{14}\b")
+    cep_re = re.compile(r"\b\d{8}\b")
+    email_re = re.compile(r"[\w\.-]+@[\w\.-]+\.\w+")
+
+    # Preenche automático se não estiver em sessão e o texto parece dado válido
+    if not session:
+        if cnpj_re.search(text):
+            SESSIONS[phone] = {"stage": "ask_city", "mode": "compra", "data": {"cnpj": text.strip()}}
+            return "📍 Informe agora a *cidade* de onde está falando."
+        if cep_re.search(text):
+            SESSIONS[phone] = {"stage": "ask_email", "mode": "compra", "data": {"cep": text.strip()}}
+            return "📧 Informe seu *e-mail* de contato para finalizarmos o pedido."
+        if email_re.search(text):
+            SESSIONS[phone] = {"stage": "done", "mode": "compra", "data": {"email": text.strip()}}
+            order_code = generate_order_code(phone)
+            save_lead(SESSIONS[phone]["data"], phone, "compra")
+            SESSIONS.pop(phone, None)
+            return f"✅ Pedido registrado com sucesso! Seu código é *{order_code}*.\nUm atendente entrará em contato em breve."
+    
+    # Fluxo normal do cadastro
     if stage == "ask_name":
         session["data"]["nome"] = text.strip()
         session["stage"] = "ask_company"
@@ -112,33 +162,25 @@ def continue_lead_capture(phone: str, text: str):
 
     if stage == "ask_email":
         session["data"]["email"] = text.strip()
+        order_code = generate_order_code(phone)
         session["stage"] = "done"
         save_lead(session["data"], phone, mode)
         SESSIONS.pop(phone, None)
-        return (
-            "🧾 Pedido registrado com sucesso! Um atendente entrará em contato para confirmar os detalhes.\n"
-            f"Resumo: *{session['data']['nome']}*, *{session['data']['empresa']}*, *{session['data']['cidade']}*, *{session['data']['cep']}*, *{session['data']['email']}*."
+
+        resumo = (
+            "🧾 *Resumo do Pedido*\n"
+            f"👤 Nome: {session['data'].get('nome','')}\n"
+            f"🏢 Empresa: {session['data'].get('empresa','')}\n"
+            f"🆔 CNPJ: {session['data'].get('cnpj','')}\n"
+            f"📍 Cidade: {session['data'].get('cidade','')}\n"
+            f"📮 CEP: {session['data'].get('cep','')}\n"
+            f"✉️ E-mail: {session['data'].get('email','')}\n"
+            f"🪪 Código do Pedido: *{order_code}*\n\n"
+            "Um atendente entrará em contato para confirmar os detalhes."
         )
+        return resumo
 
     return "Pode repetir, por favor? Vamos começar com seu *nome*."
-
-
-def save_lead(data: dict, phone: str, mode: str = "atendimento"):
-    file_exists = LEADS_CSV.exists()
-    with LEADS_CSV.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["telefone", "nome", "empresa", "cnpj", "cidade", "cep", "email", "modo"])
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow({
-            "telefone": phone,
-            "nome": data.get("nome", ""),
-            "empresa": data.get("empresa", ""),
-            "cnpj": data.get("cnpj", ""),
-            "cidade": data.get("cidade", ""),
-            "cep": data.get("cep", ""),
-            "email": data.get("email", ""),
-            "modo": mode
-        })
 
 # ==============================
 # ROTEAMENTO DE MENSAGENS
@@ -200,7 +242,6 @@ def route_message(phone: str, text: str) -> str:
 
     return "⚡ Digite *menu* para ver as opções novamente."
 
-
 # ==============================
 # ENDPOINTS
 # ==============================
@@ -222,83 +263,15 @@ async def receber(request: Request):
         .strip()
     )
 
-    # ===== Extração ROBUSTA do TEXTO =====
     text = ""
-
-    # 1) caminhos diretos + aninhados comuns (Z-API)
-    candidates = [
-        ("message",),
-        ("body",),
-        ("text",),
-        ("content",),
-
-        # aninhados
-        ("text", "message"),
-        ("text", "text"),
-        ("textMessageData", "textMessage"),
-        ("extendedTextMessageData", "text"),
-        ("messageData", "textMessageData", "textMessage"),
-        ("messageData", "extendedTextMessageData", "text"),
-        ("messages", 0, "text"),
-        ("messages", 0, "body"),
-        ("messages", 0, "message"),
-        ("messages", 0, "content"),
-    ]
-
-    # 2) variações em PT
-    candidates += [
-        ("texto",),
-        ("conteudo",),
-        ("texto", "mensagem"),
-        ("mensagem",),
-    ]
-
-    def pick(d, path):
-        cur = d
-        for key in path:
-            if isinstance(key, int):
-                if isinstance(cur, list) and len(cur) > key:
-                    cur = cur[key]
-                else:
-                    return None
-            else:
-                if isinstance(cur, dict) and key in cur:
-                    cur = cur.get(key)
-                else:
-                    return None
-        return cur if isinstance(cur, str) and cur.strip() else None
-
-    for path in candidates:
-        val = pick(data, path)
-        if val:
-            text = val.strip()
+    for k in ("message", "body", "text", "content", "texto"):
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            text = v.strip()
             break
-
-    # 3) fallback: varre todo o dict procurando o primeiro valor string não vazio
-    if not text and isinstance(data, dict):
-        stack, seen = [data], set()
-        while stack:
-            node = stack.pop()
-            if id(node) in seen:
-                continue
-            seen.add(id(node))
-
-            if isinstance(node, dict):
-                for v in node.values():
-                    if isinstance(v, str) and v.strip():
-                        text = v.strip()
-                        stack.clear()
-                        break
-                    if isinstance(v, (dict, list)):
-                        stack.append(v)
-            elif isinstance(node, list):
-                for v in node:
-                    if isinstance(v, str) and v.strip():
-                        text = v.strip()
-                        stack.clear()
-                        break
-                    if isinstance(v, (dict, list)):
-                        stack.append(v)
+        if isinstance(v, dict) and "mensagem" in v:
+            text = v["mensagem"].strip()
+            break
 
     print("==> MSG DE:", phone, "| TEXTO:", text)
 
@@ -334,7 +307,6 @@ async def receber(request: Request):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
 
 # ==============================
 # RODAR LOCALMENTE
