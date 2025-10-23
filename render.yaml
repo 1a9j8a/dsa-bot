@@ -4,6 +4,21 @@ services:
     env: python
     plan: pro
     region: oregon
-    buildCommand: "pip install -r requirements.txt"
+    buildCommand: "pip install -r requisitos.txt"
     startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
-    healthCheckPath: /health       # <── ESTA LINHA AQUI
+    healthCheckPath: /health  # <── Verificação de saúde correta
+    autoDeploy: true
+
+    envVars:
+      - key: ZAPI_BASE
+        value: https://api.z-api.io
+      - key: ZAPI_INSTANCE_ID
+        value: SUA_INSTANCE_ID
+      - key: ZAPI_TOKEN
+        value: SEU_TOKEN
+      - key: ZAPI_CLIENT_TOKEN
+        value: SEU_CLIENT_TOKEN
+      - key: CATALOG_REZYMOL_URL
+        value: https://link-do-catalogo-rezymol.pdf
+      - key: CATALOG_PITTY_URL
+        value: https://link-do-catalogo-pitty.pdf
