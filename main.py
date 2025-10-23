@@ -85,7 +85,7 @@ def welcome_text(first_name: str | None = None) -> str:
         "2 - *Compras*\n"
         "3 - *Representantes*\n"
         "4 - *Fornecedores - MP*\n"
-        "5 - *Falar com um atendente*\n\n"
+        "5 - *Falar com um atendente/especialista*\n\n"
         "Você pode digitar o número da opção ou escrever sua dúvida.\n"
         "Comandos rápidos: *compra*, *catálogo*, *produtos*."
     )
