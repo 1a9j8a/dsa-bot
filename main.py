@@ -263,15 +263,79 @@ async def receber(request: Request):
         .strip()
     )
 
+    # ===== Extração ROBUSTA do TEXTO (substitui o bloco antigo) =====
     text = ""
-    for k in ("message", "body", "text", "content", "texto"):
-        v = data.get(k)
+
+    def pick_first_nonempty(*values):
+        for v in values:
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+
+    # 1) chaves diretas de 1º nível
+    for key in ("message", "body", "text", "content", "caption"):
+        v = data.get(key)
         if isinstance(v, str) and v.strip():
             text = v.strip()
             break
-        if isinstance(v, dict) and "mensagem" in v:
-            text = v["mensagem"].strip()
-            break
+        if isinstance(v, dict):
+            inner = pick_first_nonempty(
+                v.get("message", ""),
+                v.get("body", ""),
+                v.get("text", ""),
+                v.get("caption", "")
+            )
+            if inner:
+                text = inner
+                break
+
+    # 2) combinações comuns (ex.: {"text":{"message":"oi"}})
+    if not text:
+        combo_keys = [
+            ("text", "message"),
+            ("text", "body"),
+            ("texto", "mensagem"),  # payloads PT-BR que vimos no log
+        ]
+        for a, b in combo_keys:
+            d = data.get(a)
+            if isinstance(d, dict):
+                inner = d.get(b)
+                if isinstance(inner, str) and inner.strip():
+                    text = inner.strip()
+                    break
+
+    # 3) bloco messageData -> (textMessageData | extendedTextMessageData)
+    if not text:
+        md = data.get("messageData")
+        if isinstance(md, dict):
+            for sub in ("textMessageData", "extendedTextMessageData"):
+                tmd = md.get(sub)
+                if isinstance(tmd, dict):
+                    inner = pick_first_nonempty(
+                        tmd.get("textMessage", ""),
+                        tmd.get("text", ""),
+                        tmd.get("caption", ""),
+                        tmd.get("body", "")
+                    )
+                    if inner:
+                        text = inner
+                        break
+
+    # 4) algumas integrações mandam array 'messages'
+    if not text:
+        msgs = data.get("messages")
+        if isinstance(msgs, list) and msgs:
+            m0 = msgs[0]
+            if isinstance(m0, dict):
+                inner = pick_first_nonempty(
+                    m0.get("text", ""),
+                    m0.get("body", ""),
+                    m0.get("message", ""),
+                    m0.get("content", ""),
+                    m0.get("caption", "")
+                )
+                if inner:
+                    text = inner
 
     print("==> MSG DE:", phone, "| TEXTO:", text)
 
@@ -284,23 +348,30 @@ async def receber(request: Request):
     if reply == "__SEND_CATALOG_REZYMOL__":
         if CATALOG_REZYMOL_URL:
             status, resp = await send_file_via_zapi(phone, CATALOG_REZYMOL_URL, "Catalogo-Rezymol.pdf", "📄 Catálogo Rezymol")
+            print(f"<== Z-API SEND-FILE (Rezymol) STATUS: {status} | RESP: {resp}")
             if status >= 300:
-                await send_text_via_zapi(phone, f"📄 Catálogo Rezymol: {CATALOG_REZYMOL_URL}")
+                status2, resp2 = await send_text_via_zapi(phone, f"📄 Catálogo Rezymol: {CATALOG_REZYMOL_URL}")
+                print(f"<== Z-API FALLBACK TEXT STATUS: {status2} | RESP: {resp2}")
         else:
-            await send_text_via_zapi(phone, "📄 Catálogo Rezymol ainda não configurado.")
+            status3, resp3 = await send_text_via_zapi(phone, "📄 Catálogo Rezymol ainda não configurado.")
+            print(f"<== Z-API NO-CATALOG TEXT STATUS: {status3} | RESP: {resp3}")
         return JSONResponse({"ok": True})
 
     if reply == "__SEND_CATALOG_PITTY__":
         if CATALOG_PITTY_URL:
             status, resp = await send_file_via_zapi(phone, CATALOG_PITTY_URL, "Catalogo-Pitty.pdf", "📄 Catálogo Pitty")
+            print(f"<== Z-API SEND-FILE (Pitty) STATUS: {status} | RESP: {resp}")
             if status >= 300:
-                await send_text_via_zapi(phone, f"📄 Catálogo Pitty: {CATALOG_PITTY_URL}")
+                status2, resp2 = await send_text_via_zapi(phone, f"📄 Catálogo Pitty: {CATALOG_PITTY_URL}")
+                print(f"<== Z-API FALLBACK TEXT STATUS: {status2} | RESP: {resp2}")
         else:
-            await send_text_via_zapi(phone, "📄 Catálogo Pitty ainda não configurado.")
+            status3, resp3 = await send_text_via_zapi(phone, "📄 Catálogo Pitty ainda não configurado.")
+            print(f"<== Z-API NO-CATALOG TEXT STATUS: {status3} | RESP: {resp3}")
         return JSONResponse({"ok": True})
 
-    # resposta normal
-    await send_text_via_zapi(phone, reply)
+    # resposta normal (com log do status/resp)
+    status, resp = await send_text_via_zapi(phone, reply)
+    print(f"<== Z-API SEND-TEXT STATUS: {status} | RESP: {resp}")
     return JSONResponse({"ok": True})
 
 
