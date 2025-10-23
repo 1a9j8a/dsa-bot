@@ -1,6 +1,7 @@
 import os
 import csv
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from fastapi import FastAPI, Request
@@ -18,18 +19,47 @@ INSTANCE_ID = os.getenv("ZAPI_INSTANCE_ID")
 TOKEN = os.getenv("ZAPI_TOKEN")
 CLIENT_TOKEN = os.getenv("ZAPI_CLIENT_TOKEN")
 CATALOG_REZYMOL_URL = os.getenv("CATALOG_REZYMOL_URL", "")
-CATALOG_PITTY_URL = os.getenv("CATALOG_PITTY_URL", "")
 
 app = FastAPI(title="DSA Bot - Spark")
 
 # ==============================
 # VARIÁVEIS GLOBAIS
 # ==============================
-SESSIONS = {}
+SESSIONS: dict[str, dict] = {}   # estado por telefone
 LEADS_CSV = Path("leads.csv")
+KNOWN_NAMES: dict[str, str] = {} # armazena primeiro nome por telefone (quando vier do senderName)
+IDLE_NUDGE_SECONDS = 600         # 10min
 
 # ==============================
-# FUNÇÕES DE ENVIO VIA Z-API
+# TABELA DE PRODUTOS (REZYMOL)
+# ==============================
+PRODUCTS = {
+    "1": {"code": "982 NI", "name": "Fluido Antiaderente (coladeiras de borda)"},
+    "2": {"code": "984 RD", "name": "Fluido Resfriador (coladeiras de borda)"},
+    "3": {"code": "985 AT", "name": "Fluido Antiestático (coladeiras de borda)"},
+    "4": {"code": "983 FI", "name": "Fluido Finalizador (coladeiras de borda)"},
+    "5": {"code": "1250 BSC", "name": "Limpa Chapas / Remoção de Cola"},
+    "6": {"code": "1100 BSC", "name": "Limpa Chapas / Peças"},
+    "7": {"code": "LIMPA COLEIROS", "name": "Limpa Coleiros"},
+    "8": {"code": "DESENGRAXANTES", "name": "Desengraxantes"},
+    "9": {"code": "REM RESINAS", "name": "Removedor de Resinas"},
+    "10": {"code": "REM TINTA ANILOX", "name": "Removedor de Tintas Anilox"},
+}
+
+def produtos_menu_text() -> str:
+    lines = ["🟢 *Linha Rezymol – Setor Moveleiro*"]
+    for i in range(1, 11):
+        key = str(i)
+        item = PRODUCTS[key]
+        lines.append(f"{key}. *{item['code']}* — {item['name']}")
+    lines.append(
+        "\nPara comprar, responda com os itens e quantidades. Ex.: *1x2, 4x1* ou *982 NI x2, 983 FI x1*.\n"
+        "Quando terminar, digite *finalizar*."
+    )
+    return "\n".join(lines)
+
+# ==============================
+# ENVIO VIA Z-API
 # ==============================
 async def send_text_via_zapi(phone: str, message: str):
     url = f"{ZAPI_BASE}/instances/{INSTANCE_ID}/token/{TOKEN}/send-text"
@@ -37,8 +67,8 @@ async def send_text_via_zapi(phone: str, message: str):
     headers = {"Client-Token": CLIENT_TOKEN}
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(url, json=payload, headers=headers)
+    print(f"<== Z-API SEND-TEXT STATUS: {r.status_code} | RESP: {r.text}")
     return r.status_code, r.text
-
 
 async def send_file_via_zapi(phone: str, file_url: str, file_name: str = "", caption: str = ""):
     url = f"{ZAPI_BASE}/instances/{INSTANCE_ID}/token/{TOKEN}/send-file"
@@ -46,201 +76,337 @@ async def send_file_via_zapi(phone: str, file_url: str, file_name: str = "", cap
     headers = {"Client-Token": CLIENT_TOKEN}
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(url, json=payload, headers=headers)
+    print(f"<== Z-API SEND-FILE STATUS: {r.status_code} | RESP: {r.text}")
     return r.status_code, r.text
 
 # ==============================
-# MENSAGEM DE BOAS-VINDAS
+# BOAS-VINDAS
 # ==============================
-WELCOME = (
-    "⚡ Olá! Sou o *Spark*, assistente virtual da *DSA Cristal Química*.\n"
-    "Seja muito bem-vindo(a)! 👋\n\n"
-    "Como posso te ajudar hoje?\n\n"
-    "1️⃣ *Produtos Rezymol* (linha moveleira)\n"
-    "2️⃣ *Linha Pitty* (biossegurança e higienização industrial)\n"
-    "3️⃣ *Falar com um atendente humano*\n\n"
-    "Digite o número da opção desejada."
-)
+def welcome_text(first_name: str | None = None) -> str:
+    saud = "Olá! 😊 Tudo bem?"
+    prazer = f" Prazer em te conhecer, {first_name}!" if first_name else ""
+    base = (
+        f"{saud}{prazer}\n\n"
+        "⚡ Eu sou o *Spark*, assistente virtual da *DSA Cristal Química*.\n"
+        "Como posso te ajudar hoje?\n\n"
+        "1️⃣ *Produtos Rezymol*\n"
+        "2️⃣ *Compra*\n"
+        "3️⃣ *Catálogo Rezymol*\n"
+        "4️⃣ *Falar com um atendente*\n"
+        "5️⃣ *Auxílio técnico*\n\n"
+        "Você pode digitar o número da opção ou escrever sua dúvida.\n"
+        "Comandos rápidos: *compra*, *catálogo*, *produtos*."
+    )
+    return base
 
 # ==============================
-# FUNÇÕES AUXILIARES
+# AUXILIARES
 # ==============================
-def generate_order_code(phone: str) -> str:
-    """Gera um código único para o pedido com base no telefone e data."""
-    date_str = datetime.now().strftime("%Y%m%d")
-    short_phone = phone[-4:] if phone else "0000"
-    return f"PED-{short_phone}-{date_str}-{str(len(SESSIONS) + 1).zfill(3)}"
+def greeting_match(tl: str) -> bool:
+    return any(kw in tl for kw in (
+        "oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "menu", "inicio", "start", "spark"
+    ))
 
+def first_name_from_sender(sender: str | None) -> str | None:
+    if not sender:
+        return None
+    s = sender.strip()
+    # pega a primeira palavra antes de emoji etc.
+    s = re.split(r"[^\wÀ-ÖØ-öø-ÿ'-]+", s)[0]
+    return s if s else None
 
 def save_lead(data: dict, phone: str, mode: str = "atendimento"):
     file_exists = LEADS_CSV.exists()
     with LEADS_CSV.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["telefone", "nome", "empresa", "cnpj", "cidade", "cep", "email", "modo"])
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "telefone", "nome", "telefone_cliente", "perfil", "empresa", "cnpj",
+                "cidade", "rua", "bairro", "cep", "email", "modo", "itens", "auxilio_tecnico"
+            ]
+        )
         if not file_exists:
             writer.writeheader()
         writer.writerow({
             "telefone": phone,
             "nome": data.get("nome", ""),
+            "telefone_cliente": data.get("telefone_cliente", ""),
+            "perfil": data.get("perfil", ""),
             "empresa": data.get("empresa", ""),
             "cnpj": data.get("cnpj", ""),
             "cidade": data.get("cidade", ""),
+            "rua": data.get("rua", ""),
+            "bairro": data.get("bairro", ""),
             "cep": data.get("cep", ""),
             "email": data.get("email", ""),
-            "modo": mode
+            "modo": mode,
+            "itens": "; ".join([f"{i['code']} x{i['qty']}" for i in data.get("cart", [])]) if data.get("cart") else "",
+            "auxilio_tecnico": data.get("auxilio_tecnico", ""),
         })
 
+def ensure_session(phone: str):
+    SESSIONS.setdefault(phone, {"stage": None, "mode": None, "data": {}, "last": time.time()})
+    SESSIONS[phone]["last"] = time.time()
+
+def maybe_idle_nudge(phone: str) -> str | None:
+    sess = SESSIONS.get(phone)
+    if not sess:
+        return None
+    last = sess.get("last", time.time())
+    if time.time() - last > IDLE_NUDGE_SECONDS and sess.get("stage") not in (None, "done"):
+        SESSIONS[phone]["last"] = time.time()
+        return "Entendi! Pode me contar qual é a sua dúvida? Estou aqui pra te ajudar 👍"
+    return None
+
 # ==============================
-# CAPTURA DE LEADS E COMPRAS
+# PARSE DE ITENS (NÚMERO/ CÓDIGO + QUANTIDADE)
 # ==============================
-def start_lead_capture(phone: str, mode: str = "atendimento"):
+def parse_items_line(line: str) -> list[dict]:
+    """
+    Aceita formatos:
+      - "1x2, 4x1"
+      - "1 x 2; 3x5"
+      - "982 NI x2, 983 FI x1"
+    Retorna lista de dicts: {"code": "...", "qty": int}
+    """
+    out = []
+
+    # 1) Por número (id do menu): ex. 1x2
+    for part in re.split(r"[;,]+", line):
+        part = part.strip()
+        m = re.match(r"^\s*(\d{1,2})\s*x\s*(\d{1,3})\s*$", part, re.IGNORECASE)
+        if m:
+            idx, qty = m.group(1), int(m.group(2))
+            if idx in PRODUCTS and qty > 0:
+                out.append({"code": PRODUCTS[idx]["code"], "qty": qty})
+
+    # 2) Por código (texto + xqtd): ex. "982 NI x2"
+    #    captura até 'x', depois a quantidade
+    for code, qty in re.findall(r"([A-Za-z0-9 ]{2,20})\s*x\s*(\d{1,3})", line, re.IGNORECASE):
+        code = code.strip().upper()
+        # tenta casar com tabela (por code):
+        valid_code = None
+        for p in PRODUCTS.values():
+            if code == p["code"].upper():
+                valid_code = p["code"]
+                break
+        if valid_code and int(qty) > 0:
+            out.append({"code": valid_code, "qty": int(qty)})
+
+    return out
+
+# ==============================
+# FLUXOS
+# ==============================
+def start_flow(phone: str, mode: str):
+    ensure_session(phone)
+    SESSIONS[phone].update({"mode": mode, "stage": "ask_name", "data": {"cart": []}})
     if mode == "compra":
-        SESSIONS[phone] = {"stage": "ask_name", "mode": "compra", "data": {}}
         return "🛒 Vamos registrar seu pedido! Qual é o seu *nome*?"
-    else:
-        SESSIONS[phone] = {"stage": "ask_name", "mode": "atendimento", "data": {}}
-        return "📞 Vamos agilizar seu atendimento humano. Qual é o seu *nome*?"
+    if mode == "catalogo":
+        return "📄 Para enviar o catálogo, preciso de alguns dados. Qual é o seu *nome*?"
+    # atendimento
+    return "📞 Vamos agilizar seu atendimento humano. Qual é o seu *nome*?"
 
+def continue_flow(phone: str, text: str) -> str:
+    ensure_session(phone)
+    sess = SESSIONS[phone]
+    data = sess["data"]
+    mode = sess["mode"]
+    tl = text.lower().strip()
 
-def continue_lead_capture(phone: str, text: str):
-    session = SESSIONS.get(phone, {})
-    stage = session.get("stage")
-    mode = session.get("mode", "atendimento")
+    # Nudge se ficou parado
+    nudge = maybe_idle_nudge(phone)
+    prefix = f"{nudge}\n\n" if nudge else ""
 
-    # Expressões para detectar dados automaticamente
-    cnpj_re = re.compile(r"\b\d{14}\b")
-    cep_re = re.compile(r"\b\d{8}\b")
-    email_re = re.compile(r"[\w\.-]+@[\w\.-]+\.\w+")
+    # ========== ETAPAS COMUNS ==========
+    if sess["stage"] == "ask_name":
+        data["nome"] = text.strip()
+        sess["stage"] = "ask_phone"
+        return prefix + "Por favor, informe seu *telefone* com DDD."
 
-    # Preenche automático se não estiver em sessão e o texto parece dado válido
-    if not session:
-        if cnpj_re.search(text):
-            SESSIONS[phone] = {"stage": "ask_city", "mode": "compra", "data": {"cnpj": text.strip()}}
-            return "📍 Informe agora a *cidade* de onde está falando."
-        if cep_re.search(text):
-            SESSIONS[phone] = {"stage": "ask_email", "mode": "compra", "data": {"cep": text.strip()}}
-            return "📧 Informe seu *e-mail* de contato para finalizarmos o pedido."
-        if email_re.search(text):
-            SESSIONS[phone] = {"stage": "done", "mode": "compra", "data": {"email": text.strip()}}
-            order_code = generate_order_code(phone)
-            save_lead(SESSIONS[phone]["data"], phone, "compra")
-            SESSIONS.pop(phone, None)
-            return f"✅ Pedido registrado com sucesso! Seu código é *{order_code}*.\nUm atendente entrará em contato em breve."
-    
-    # Fluxo normal do cadastro
-    if stage == "ask_name":
-        session["data"]["nome"] = text.strip()
-        session["stage"] = "ask_company"
-        return f"Ótimo, *{session['data']['nome']}*! Qual é o nome da *empresa*?"
+    if sess["stage"] == "ask_phone":
+        data["telefone_cliente"] = re.sub(r"\D", "", text)
+        sess["stage"] = "ask_profile"
+        return prefix + (
+            "Qual é o seu *perfil*?\n"
+            "1) Representante\n"
+            "2) Cliente\n"
+            "3) Distribuidor\n"
+            "4) Fornecedor de Produtos - Matéria Prima"
+        )
 
-    if stage == "ask_company":
-        session["data"]["empresa"] = text.strip()
-        session["stage"] = "ask_cnpj"
-        return "Perfeito. Qual é o *CNPJ* da empresa?"
+    if sess["stage"] == "ask_profile":
+        perfis = {"1": "Representante", "2": "Cliente", "3": "Distribuidor", "4": "Fornecedor de Produtos - Matéria Prima"}
+        data["perfil"] = perfis.get(tl, text.strip())
+        sess["stage"] = "ask_company"
+        return prefix + "Qual é o nome da *empresa*?"
 
-    if stage == "ask_cnpj":
-        session["data"]["cnpj"] = text.strip()
-        session["stage"] = "ask_city"
-        return "Informe agora a *cidade* de onde está falando."
+    if sess["stage"] == "ask_company":
+        data["empresa"] = text.strip()
+        sess["stage"] = "ask_cnpj"
+        return prefix + "Perfeito. Qual é o *CNPJ* da empresa? (somente números)"
 
-    if stage == "ask_city":
-        session["data"]["cidade"] = text.strip()
-        if mode == "compra":
-            session["stage"] = "ask_cep"
-            return "Informe também o *CEP* da sua região."
-        else:
-            session["stage"] = "done"
-            save_lead(session["data"], phone, mode)
-            SESSIONS.pop(phone, None)
-            return (
-                "✅ Dados recebidos! Em instantes um atendente da DSA falará com você.\n"
-                f"Resumo: *{session['data']['nome']}*, *{session['data']['empresa']}*, *{session['data']['cidade']}*."
+    if sess["stage"] == "ask_cnpj":
+        m = re.search(r"\b\d{14}\b", text)
+        data["cnpj"] = (m.group(0) if m else re.sub(r"\D", "", text))
+        sess["stage"] = "ask_city"
+        return prefix + "Informe a *cidade*."
+
+    if sess["stage"] == "ask_city":
+        data["cidade"] = text.strip()
+        sess["stage"] = "ask_rua"
+        return prefix + "Endereço de entrega — informe a *Rua/Av*."
+
+    if sess["stage"] == "ask_rua":
+        data["rua"] = text.strip()
+        sess["stage"] = "ask_bairro"
+        return prefix + "Agora o *Bairro*."
+
+    if sess["stage"] == "ask_bairro":
+        data["bairro"] = text.strip()
+        sess["stage"] = "ask_cep"
+        return prefix + "Informe o *CEP* (somente números)."
+
+    if sess["stage"] == "ask_cep":
+        m = re.search(r"\b\d{8}\b", text)
+        data["cep"] = (m.group(0) if m else re.sub(r"\D", "", text))
+        if mode == "catalogo":
+            # catálogo exige até cidade, mas vamos aproveitar endereço se deu
+            sess["stage"] = "ask_email_catalogo"
+            return prefix + "Por fim, seu *e-mail* para enviar também as informações."
+        # compra segue
+        sess["stage"] = "ask_email"
+        return prefix + "Por fim, seu *e-mail* de contato."
+
+    # ========== CATÁLOGO ==========
+    if mode == "catalogo":
+        if sess["stage"] == "ask_email_catalogo":
+            data["email"] = text.strip()
+            sess["stage"] = "done"
+            save_lead(data, phone, "catalogo")
+
+            resumo = (
+                "✅ Dados recebidos! Enviarei o *Catálogo Rezymol* em seguida.\n"
+                f"Resumo: *{data.get('nome','')}*, *{data.get('empresa','')}*, *{data.get('cnpj','')}*, "
+                f"*{data.get('cidade','')}*."
+            )
+            # marcador para o endpoint enviar o arquivo
+            return f"{resumo}\n__SEND_CATALOG_AFTER_LEAD__:rezymol"
+
+    # ========== COMPRA ==========
+    if mode == "compra":
+        if sess["stage"] == "ask_email":
+            data["email"] = text.strip()
+            sess["stage"] = "ask_items"
+            return prefix + (
+                "Perfeito! Agora me diga quais *produtos e quantidades* você quer.\n\n"
+                + produtos_menu_text()
             )
 
-    if stage == "ask_cep":
-        session["data"]["cep"] = text.strip()
-        session["stage"] = "ask_email"
-        return "Por fim, poderia me informar seu *e-mail* de contato?"
+        if sess["stage"] == "ask_items":
+            if tl in ("finalizar", "ok", "confirmar"):
+                if not data.get("cart"):
+                    return prefix + "Você ainda não adicionou itens. Envie algo como *1x2, 4x1* ou *982 NI x2*."
+                sess["stage"] = "ask_auxilio"
+                return prefix + "Você precisa de *auxílio técnico* para sua compra? 🤔 (responda *sim* ou *não*)"
 
-    if stage == "ask_email":
-        session["data"]["email"] = text.strip()
-        order_code = generate_order_code(phone)
-        session["stage"] = "done"
-        save_lead(session["data"], phone, mode)
-        SESSIONS.pop(phone, None)
+            # tenta parsear itens
+            items = parse_items_line(text)
+            if not items:
+                return prefix + (
+                    "Não consegui entender os itens. Tente assim: *1x2, 4x1* ou *982 NI x2*.\n"
+                    "Quando terminar, digite *finalizar*."
+                )
+            data.setdefault("cart", [])
+            data["cart"].extend(items)
 
-        resumo = (
-            "🧾 *Resumo do Pedido*\n"
-            f"👤 Nome: {session['data'].get('nome','')}\n"
-            f"🏢 Empresa: {session['data'].get('empresa','')}\n"
-            f"🆔 CNPJ: {session['data'].get('cnpj','')}\n"
-            f"📍 Cidade: {session['data'].get('cidade','')}\n"
-            f"📮 CEP: {session['data'].get('cep','')}\n"
-            f"✉️ E-mail: {session['data'].get('email','')}\n"
-            f"🪪 Código do Pedido: *{order_code}*\n\n"
-            "Um atendente entrará em contato para confirmar os detalhes."
-        )
-        return resumo
+            # mostra carrinho parcial
+            carrinho = "\n".join([f"• {i['code']} x{i['qty']}" for i in data["cart"]])
+            return prefix + (
+                "Itens adicionados com sucesso! 🧺\n"
+                f"{carrinho}\n\n"
+                "Você pode enviar mais itens, ou digitar *finalizar* para seguir."
+            )
 
-    return "Pode repetir, por favor? Vamos começar com seu *nome*."
+        if sess["stage"] == "ask_auxilio":
+            data["auxilio_tecnico"] = "sim" if "sim" in tl else "não"
+            # finaliza pedido
+            order_code = generate_order_code(phone)
+            sess["stage"] = "done"
+            save_lead(data, phone, "compra")
+            SESSIONS.pop(phone, None)
+
+            carrinho = "\n".join([f"• {i['code']} x{i['qty']}" for i in data.get("cart", [])]) or "—"
+            resumo = (
+                "🧾 *Resumo do Pedido*\n"
+                f"👤 Nome: {data.get('nome','')}\n"
+                f"📞 Telefone: {data.get('telefone_cliente','')}\n"
+                f"🧭 Perfil: {data.get('perfil','')}\n"
+                f"🏢 Empresa: {data.get('empresa','')}\n"
+                f"🆔 CNPJ: {data.get('cnpj','')}\n"
+                f"📍 Cidade: {data.get('cidade','')}\n"
+                f"🏠 Rua: {data.get('rua','')}\n"
+                f"🏘️ Bairro: {data.get('bairro','')}\n"
+                f"📮 CEP: {data.get('cep','')}\n"
+                f"✉️ E-mail: {data.get('email','')}\n"
+                f"🧺 Itens:\n{carrinho}\n"
+                f"🧩 Auxílio técnico: {data.get('auxilio_tecnico','')}\n"
+                f"🪪 Código do Pedido: *{order_code}*\n\n"
+                "Um atendente entrará em contato para confirmar os detalhes. Obrigado!"
+            )
+            return prefix + resumo
+
+    # ========== ATENDIMENTO ==========
+    if mode == "atendimento":
+        # depois do endereço, já fechamos no ask_cep
+        if sess["stage"] == "ask_email":
+            data["email"] = text.strip()
+            sess["stage"] = "done"
+            save_lead(data, phone, "atendimento")
+            SESSIONS.pop(phone, None)
+            return prefix + (
+                "✅ Dados recebidos! Em instantes um atendente da DSA falará com você.\n"
+                f"Resumo: *{data.get('nome','')}*, *{data.get('empresa','')}*, *{data.get('cidade','')}*."
+            )
+
+    # fallback
+    return prefix + "Pode repetir, por favor?"
 
 # ==============================
 # ROTEAMENTO DE MENSAGENS
 # ==============================
 def route_message(phone: str, text: str) -> str:
+    ensure_session(phone)
     t = (text or "").strip()
     tl = t.lower()
 
-    # se já está em um fluxo
-    if phone in SESSIONS:
-        return continue_lead_capture(phone, t)
+    # Se já está em um fluxo
+    if SESSIONS.get(phone, {}).get("stage") not in (None, "done"):
+        return continue_flow(phone, t)
 
-    # comandos básicos
-    if tl in ("oi", "olá", "ola", "menu", "inicio", "start", "spark"):
-        return WELCOME
+    # Saudações / menu
+    if greeting_match(tl):
+        first = KNOWN_NAMES.get(phone)
+        return welcome_text(first)
 
-    # produtos Rezymol
-    if tl.startswith("1") or "rezymol" in tl:
-        return (
-            "🟢 *Linha Rezymol – Setor Moveleiro*\n"
-            "• 982 NI – Fluido Antiaderente (coladeiras de borda)\n"
-            "• 983 FI – Fluido Finalizador (coladeiras de borda)\n"
-            "• 984 RD – Fluido Resfriador (coladeiras de borda)\n"
-            "• 985 AT – Fluido Antiestático (coladeiras de borda)\n"
-            "• 1250 BSC – Limpa chapas e remoção de cola\n"
-            "• 1100 BSC – Limpa chapas e peças\n"
-            "• Limpa Coleiros | Desengraxantes | Removedores de resina e tinta anilox\n\n"
-            "Para continuar:\n"
-            "✳️ Digite *catálogo rezymol* para ver o catálogo\n"
-            "🛒 Digite *compra rezymol* para registrar um pedido"
-        )
+    # Números diretos
+    if tl.startswith("1"):
+        return produtos_menu_text()
+    if tl.startswith("2") or "compra" in tl:
+        return start_flow(phone, "compra")
+    if tl.startswith("3") or "catálogo" in tl or "catalogo" in tl:
+        return start_flow(phone, "catalogo")
+    if tl.startswith("4") or "atendente" in tl or "humano" in tl:
+        return start_flow(phone, "atendimento")
+    if tl.startswith("5") or "auxílio técnico" in tl or "auxilio tecnico" in tl:
+        return "Posso te orientar na escolha do produto ideal. Diga qual equipamento/processo e o tipo de sujidade/resíduo que deseja resolver."
 
-    # linha Pitty
-    if tl.startswith("2") or "pitty" in tl:
-        return (
-            "🟣 *Linha Pitty – Biossegurança e Higiene Industrial*\n"
-            "• BSC 1100 – Limpeza pesada e sanitização\n"
-            "• 890 – Desincrustante industrial\n"
-            "• Protocolos de limpeza e higienização para frigoríficos e indústrias.\n\n"
-            "Para continuar:\n"
-            "✳️ Digite *catálogo pitty* ou *compra pitty*."
-        )
+    # Produtos / Rezymol palavras-chave
+    if "rezymol" in tl or "produtos" in tl:
+        return produtos_menu_text()
 
-    # atendente humano
-    if tl.startswith("3") or "atendente" in tl or "humano" in tl:
-        return start_lead_capture(phone, "atendimento")
-
-    # catálogos
-    if "catálogo" in tl or "catalogo" in tl:
-        if "rezymol" in tl:
-            return "__SEND_CATALOG_REZYMOL__"
-        if "pitty" in tl:
-            return "__SEND_CATALOG_PITTY__"
-        return "📄 De qual linha você deseja o catálogo? *Rezymol* ou *Pitty*?"
-
-    # compras
-    if "compra" in tl:
-        return start_lead_capture(phone, "compra")
-
-    return "⚡ Digite *menu* para ver as opções novamente."
+    return "⚡ Digite *menu* para ver as opções ou *compra* para iniciar seu pedido."
 
 # ==============================
 # ENDPOINTS
@@ -249,13 +415,13 @@ def route_message(phone: str, text: str) -> str:
 async def receber_get():
     return {"ok": True, "hint": "Use POST para eventos. GET existe só para validação."}
 
-
 @app.post("/api/webhook/receber")
 async def receber(request: Request):
     body = await request.json()
     print("RAW BODY:", body)
 
     data = body.get("data") or body
+
     phone = (
         str(data.get("phone") or data.get("from") or data.get("chatId") or "")
         .replace("@c.us", "")
@@ -263,79 +429,47 @@ async def receber(request: Request):
         .strip()
     )
 
-    # ===== Extração ROBUSTA do TEXTO (substitui o bloco antigo) =====
+    # Guarda primeiro nome se veio do payload (personalização)
+    sender_name = data.get("senderName") or data.get("chatName")
+    first = first_name_from_sender(sender_name)
+    if phone and first:
+        KNOWN_NAMES[phone] = first
+
+    # Extração robusta do texto
     text = ""
-
-    def pick_first_nonempty(*values):
-        for v in values:
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-        return ""
-
-    # 1) chaves diretas de 1º nível
-    for key in ("message", "body", "text", "content", "caption"):
-        v = data.get(key)
+    for k in ("message", "body", "text", "content", "texto"):
+        v = data.get(k)
         if isinstance(v, str) and v.strip():
             text = v.strip()
             break
         if isinstance(v, dict):
-            inner = pick_first_nonempty(
-                v.get("message", ""),
-                v.get("body", ""),
-                v.get("text", ""),
-                v.get("caption", "")
-            )
-            if inner:
-                text = inner
-                break
-
-    # 2) combinações comuns (ex.: {"text":{"message":"oi"}})
-    if not text:
-        combo_keys = [
-            ("text", "message"),
-            ("text", "body"),
-            ("texto", "mensagem"),  # payloads PT-BR que vimos no log
-        ]
-        for a, b in combo_keys:
-            d = data.get(a)
-            if isinstance(d, dict):
-                inner = d.get(b)
-                if isinstance(inner, str) and inner.strip():
-                    text = inner.strip()
+            for kk in ("mensagem", "text", "body", "message", "caption"):
+                vv = v.get(kk)
+                if isinstance(vv, str) and vv.strip():
+                    text = vv.strip()
                     break
-
-    # 3) bloco messageData -> (textMessageData | extendedTextMessageData)
+            if text:
+                break
     if not text:
-        md = data.get("messageData")
+        md = data.get("messageData") or {}
         if isinstance(md, dict):
-            for sub in ("textMessageData", "extendedTextMessageData"):
-                tmd = md.get(sub)
-                if isinstance(tmd, dict):
-                    inner = pick_first_nonempty(
-                        tmd.get("textMessage", ""),
-                        tmd.get("text", ""),
-                        tmd.get("caption", ""),
-                        tmd.get("body", "")
-                    )
-                    if inner:
-                        text = inner
+            tmd = md.get("textMessageData") or md.get("extendedTextMessageData") or {}
+            if isinstance(tmd, dict):
+                for kk in ("textMessage", "text", "caption", "body"):
+                    vv = tmd.get(kk)
+                    if isinstance(vv, str) and vv.strip():
+                        text = vv.strip()
                         break
-
-    # 4) algumas integrações mandam array 'messages'
     if not text:
         msgs = data.get("messages")
         if isinstance(msgs, list) and msgs:
             m0 = msgs[0]
             if isinstance(m0, dict):
-                inner = pick_first_nonempty(
-                    m0.get("text", ""),
-                    m0.get("body", ""),
-                    m0.get("message", ""),
-                    m0.get("content", ""),
-                    m0.get("caption", "")
-                )
-                if inner:
-                    text = inner
+                for kk in ("text", "body", "message", "content", "caption"):
+                    vv = m0.get(kk)
+                    if isinstance(vv, str) and vv.strip():
+                        text = vv.strip()
+                        break
 
     print("==> MSG DE:", phone, "| TEXTO:", text)
 
@@ -344,39 +478,26 @@ async def receber(request: Request):
 
     reply = route_message(phone, text)
 
-    # envio de catálogo
-    if reply == "__SEND_CATALOG_REZYMOL__":
+    # Se o reply contém marcador de catálogo, enviar o arquivo e depois a mensagem
+    if isinstance(reply, str) and "__SEND_CATALOG_AFTER_LEAD__" in reply:
         if CATALOG_REZYMOL_URL:
-            status, resp = await send_file_via_zapi(phone, CATALOG_REZYMOL_URL, "Catalogo-Rezymol.pdf", "📄 Catálogo Rezymol")
-            print(f"<== Z-API SEND-FILE (Rezymol) STATUS: {status} | RESP: {resp}")
+            status, resp = await send_file_via_zapi(
+                phone, CATALOG_REZYMOL_URL, "Catalogo-Rezymol.pdf", "📄 Catálogo Rezymol"
+            )
             if status >= 300:
-                status2, resp2 = await send_text_via_zapi(phone, f"📄 Catálogo Rezymol: {CATALOG_REZYMOL_URL}")
-                print(f"<== Z-API FALLBACK TEXT STATUS: {status2} | RESP: {resp2}")
+                await send_text_via_zapi(phone, f"📄 Catálogo Rezymol: {CATALOG_REZYMOL_URL}")
         else:
-            status3, resp3 = await send_text_via_zapi(phone, "📄 Catálogo Rezymol ainda não configurado.")
-            print(f"<== Z-API NO-CATALOG TEXT STATUS: {status3} | RESP: {resp3}")
+            await send_text_via_zapi(phone, "📄 Catálogo Rezymol não configurado no servidor.")
+        clean_reply = reply.replace("__SEND_CATALOG_AFTER_LEAD__:rezymol", "").strip()
+        await send_text_via_zapi(phone, clean_reply)
         return JSONResponse({"ok": True})
 
-    if reply == "__SEND_CATALOG_PITTY__":
-        if CATALOG_PITTY_URL:
-            status, resp = await send_file_via_zapi(phone, CATALOG_PITTY_URL, "Catalogo-Pitty.pdf", "📄 Catálogo Pitty")
-            print(f"<== Z-API SEND-FILE (Pitty) STATUS: {status} | RESP: {resp}")
-            if status >= 300:
-                status2, resp2 = await send_text_via_zapi(phone, f"📄 Catálogo Pitty: {CATALOG_PITTY_URL}")
-                print(f"<== Z-API FALLBACK TEXT STATUS: {status2} | RESP: {resp2}")
-        else:
-            status3, resp3 = await send_text_via_zapi(phone, "📄 Catálogo Pitty ainda não configurado.")
-            print(f"<== Z-API NO-CATALOG TEXT STATUS: {status3} | RESP: {resp3}")
-        return JSONResponse({"ok": True})
-
-    # resposta normal (com log do status/resp)
-    status, resp = await send_text_via_zapi(phone, reply)
-    print(f"<== Z-API SEND-TEXT STATUS: {status} | RESP: {resp}")
+    # resposta normal
+    await send_text_via_zapi(phone, reply)
     return JSONResponse({"ok": True})
 
-
 # ==============================
-# VERIFICAÇÃO DE SAÚDE (HEALTH CHECK)
+# HEALTHCHECK
 # ==============================
 @app.get("/health")
 async def health():
