@@ -31,32 +31,24 @@ KNOWN_NAMES: dict[str, str] = {} # armazena primeiro nome por telefone (quando v
 IDLE_NUDGE_SECONDS = 600         # 10min
 
 # ==============================
-# TABELA DE PRODUTOS (REZYMOL)
+# MÓDULO 2 — LINHA DE PRODUTOS REZYMOL
 # ==============================
-PRODUCTS = {
-    "1": {"code": "982 NI", "name": "Fluido Antiaderente (coladeiras de borda)"},
-    "2": {"code": "984 RD", "name": "Fluido Resfriador (coladeiras de borda)"},
-    "3": {"code": "985 AT", "name": "Fluido Antiestático (coladeiras de borda)"},
-    "4": {"code": "983 FI", "name": "Fluido Finalizador (coladeiras de borda)"},
-    "5": {"code": "1250 BSC", "name": "Limpa Chapas / Remoção de Cola"},
-    "6": {"code": "1100 BSC", "name": "Limpa Chapas / Peças"},
-    "7": {"code": "LIMPA COLEIROS", "name": "Limpa Coleiros"},
-    "8": {"code": "DESENGRAXANTES", "name": "Desengraxantes"},
-    "9": {"code": "REM RESINAS", "name": "Removedor de Resinas"},
-    "10": {"code": "REM TINTA ANILOX", "name": "Removedor de Tintas Anilox"},
-}
-
 def produtos_menu_text() -> str:
-    lines = ["🟢 *Linha Rezymol – Setor Moveleiro*"]
-    for i in range(1, 11):
-        key = str(i)
-        item = PRODUCTS[key]
-        lines.append(f"{key}. *{item['code']}* — {item['name']}")
-    lines.append(
-        "\nPara comprar, responda com os itens e quantidades. Ex.: *1x2, 4x1* ou *982 NI x2, 983 FI x1*.\n"
-        "Quando terminar, digite *finalizar*."
+    return (
+        "Conheça nossa *Linha Rezymol – Setor Moveleiro* 🪵\n\n"
+        "• 982 NI — Fluido Antiaderente (coladeiras de borda)\n"
+        "• 984 RD — Fluido Resfriador (coladeiras de borda)\n"
+        "• 985 AT — Fluido Antiestático (coladeiras de borda)\n"
+        "• 983 FI — Fluido Finalizador (coladeiras de borda)\n"
+        "• 1250 BSC — Limpa Chapas / Remoção de Cola\n"
+        "• 1100 BSC — Limpa Chapas / Peças\n"
+        "• LIMPA COLEIROS — Limpa Coleiros\n"
+        "• DESENGRAXANTES — Desengraxantes\n"
+        "• REM RESINAS — Removedor de Resinas\n"
+        "• REM TINTA ANILOX — Removedor de Tintas Anilox\n\n"
+        "📘 *Para solicitar catálogo*, digite *catálogo* ou *3*.\n\n"
+        "🛒 *Para realizar um pedido*, digite *compra* ou *2*."
     )
-    return "\n".join(lines)
 
 # ==============================
 # ENVIO VIA Z-API
@@ -80,24 +72,23 @@ async def send_file_via_zapi(phone: str, file_url: str, file_name: str = "", cap
     return r.status_code, r.text
 
 # ==============================
-# BOAS-VINDAS
+# BOAS-VINDAS (MÓDULO 1 — MENU PRINCIPAL)
 # ==============================
 def welcome_text(first_name: str | None = None) -> str:
-    saud = "Olá! 😊 Tudo bem?"
+    saudacao = "Olá! 😊 Tudo bem?"
     prazer = f" Prazer em te conhecer, {first_name}!" if first_name else ""
-    base = (
-        f"{saud}{prazer}\n\n"
+    return (
+        f"{saudacao}{prazer}\n\n"
         "⚡ Eu sou o *Spark*, assistente virtual da *DSA Cristal Química*.\n"
         "Como posso te ajudar hoje?\n\n"
-        "1️⃣ *Produtos Rezymol*\n"
-        "2️⃣ *Compra*\n"
-        "3️⃣ *Catálogo Rezymol*\n"
-        "4️⃣ *Falar com um atendente*\n"
-        "5️⃣ *Auxílio técnico*\n\n"
+        "⿡ *Produtos Rezymol*\n"
+        "⿢ *Compra*\n"
+        "⿣ *Representantes*\n"
+        "⿤ *Fornecedor de Produtos - MP*\n"
+        "⿥ *Falar com um atendente*\n\n"
         "Você pode digitar o número da opção ou escrever sua dúvida.\n"
         "Comandos rápidos: *compra*, *catálogo*, *produtos*."
     )
-    return base
 
 # ==============================
 # AUXILIARES
