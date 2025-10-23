@@ -375,8 +375,15 @@ async def receber(request: Request):
     return JSONResponse({"ok": True})
 
 
+# ==============================
+# VERIFICAÇÃO DE SAÚDE (HEALTH CHECK)
+# ==============================
 @app.get("/health")
 async def health():
+    """
+    Endpoint de verificação usado pelo Render para monitorar a aplicação.
+    Retorna status 200 e JSON {"status": "ok"} quando o servidor está ativo.
+    """
     return {"status": "ok"}
 
 # ==============================
