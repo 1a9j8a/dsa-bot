@@ -84,7 +84,7 @@ def welcome_text(first_name: str | None = None) -> str:
         "1 - *Produtos Rezymol*\n"
         "2 - *Compra*\n"
         "3 - *Representantes*\n"
-        "4 - *Fornecedor de Produtos - MP*\n"
+        "4 - *Fornecedor - MP*\n"
         "5 - *Falar com um atendente*\n\n"
         "Você pode digitar o número da opção ou escrever sua dúvida.\n"
         "Comandos rápidos: *compra*, *catálogo*, *produtos*."
