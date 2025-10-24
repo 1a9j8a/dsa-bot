@@ -180,7 +180,7 @@ def continue_flow(phone: str, text: str) -> str:
     prefix = f"{nudge}\n\n" if nudge else ""
 
     # ========== ETAPAS COMUNS ==========
-    if sess["stage"] == "ask_name":
+     if sess["stage"] == "ask_name":
         data["nome"] = text.strip()
         sess["stage"] = "ask_phone"
         return prefix + "Por favor, informe seu *telefone* com DDD."
@@ -214,15 +214,14 @@ def continue_flow(phone: str, text: str) -> str:
         return prefix + "Informe a *cidade*."
 
     if sess["stage"] == "ask_city":
-    data["cidade"] = text.strip()
-    sess["stage"] = "ask_rua"
+        data["cidade"] = text.strip()
+        sess["stage"] = "ask_rua"
 
-    # Se o perfil for Representante, muda o texto
-    if data.get("perfil", "").lower().startswith("represent"):
-        return prefix + "Informe o *endereço comercial* (Rua/Av)."
-    else:
-        return prefix + "Endereço de entrega — informe a *Rua/Av*."
-
+        # Se o perfil for Representante, muda o texto
+        if data.get("perfil", "").lower().startswith("represent"):
+            return prefix + "Informe o *endereço comercial* (Rua/Av)."
+        else:
+            return prefix + "Endereço de entrega — informe a *Rua/Av*."
 
     if sess["stage"] == "ask_rua":
         data["rua"] = text.strip()
@@ -243,6 +242,7 @@ def continue_flow(phone: str, text: str) -> str:
         # compra / atendimento seguem para e-mail
         sess["stage"] = "ask_email"
         return prefix + "Por fim, seu *e-mail* de contato."
+
 
     # ========== CATÁLOGO ==========
     if mode == "catalogo":
