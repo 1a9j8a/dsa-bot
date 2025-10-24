@@ -214,9 +214,15 @@ def continue_flow(phone: str, text: str) -> str:
         return prefix + "Informe a *cidade*."
 
     if sess["stage"] == "ask_city":
-        data["cidade"] = text.strip()
-        sess["stage"] = "ask_rua"
+    data["cidade"] = text.strip()
+    sess["stage"] = "ask_rua"
+
+    # Se o perfil for Representante, muda o texto
+    if data.get("perfil", "").lower().startswith("represent"):
+        return prefix + "Informe o *endereço comercial* (Rua/Av)."
+    else:
         return prefix + "Endereço de entrega — informe a *Rua/Av*."
+
 
     if sess["stage"] == "ask_rua":
         data["rua"] = text.strip()
