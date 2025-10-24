@@ -287,66 +287,27 @@ def continue_flow(phone: str, text: str) -> str:
 
     # ========== COMPRA ==========
     if mode == "compra":
-        if sess["stage"] == "ask_email":
-            data["email"] = text.strip()
-            sess["stage"] = "ask_items"
-            return prefix + (
-                "Perfeito! Agora me diga quais *produtos e quantidades* você quer.\n\n"
-                + produtos_menu_text()
-            )
+        if stage == "ask_email":
+    session["data"]["email"] = text.strip()
+    order_code = generate_order_code(phone)
+    session["stage"] = "done"
+    save_lead(session["data"], phone, mode)
+    SESSIONS.pop(phone, None)
 
-        if sess["stage"] == "ask_items":
-            if tl in ("finalizar", "ok", "confirmar"):
-                if not data.get("cart"):
-                    return prefix + "Você ainda não adicionou itens. Envie algo como *1x2, 4x1* ou *982 NI x2*."
-                sess["stage"] = "ask_auxilio"
-                return prefix + "Você precisa de *auxílio técnico* para sua compra? 🤔 (responda *sim* ou *não*)"
+    resumo = (
+        f"🧾 *Pedido registrado com sucesso!* Código: *{order_code}*\n\n"
+        f"👤 *Nome:* {session['data'].get('nome','')}\n"
+        f"🏢 *Empresa:* {session['data'].get('empresa','')}\n"
+        f"🆔 *CNPJ:* {session['data'].get('cnpj','')}\n"
+        f"📍 *Cidade:* {session['data'].get('cidade','')}\n"
+        f"📞 *Telefone:* {session['data'].get('telefone','')}\n"
+        f"📦 *Endereço de entrega:* {session['data'].get('endereco','')}\n"
+        f"✉️ *E-mail:* {session['data'].get('email','')}\n\n"
+        "✅ Obrigado por confiar na *DSA Cristal Química*!\n"
+        "Em instantes, um atendente entrará em contato para confirmar os detalhes do seu pedido. 🙌"
+    )
+    return resumo
 
-            # tenta parsear itens
-            items = parse_items_line(text)
-            if not items:
-                return prefix + (
-                    "Não consegui entender os itens. Tente assim: *1x2, 4x1* ou *982 NI x2*.\n"
-                    "Quando terminar, digite *finalizar*."
-                )
-            data.setdefault("cart", [])
-            data["cart"].extend(items)
-
-            # mostra carrinho parcial
-            carrinho = "\n".join([f"• {i['code']} x{i['qty']}" for i in data["cart"]])
-            return prefix + (
-                "Itens adicionados com sucesso! 🧺\n"
-                f"{carrinho}\n\n"
-                "Você pode enviar mais itens, ou digitar *finalizar* para seguir."
-            )
-
-        if sess["stage"] == "ask_auxilio":
-            data["auxilio_tecnico"] = "sim" if "sim" in tl else "não"
-            # finaliza pedido
-            order_code = generate_order_code(phone)
-            sess["stage"] = "done"
-            save_lead(data, phone, "compra")
-            SESSIONS.pop(phone, None)
-
-            carrinho = "\n".join([f"• {i['code']} x{i['qty']}" for i in data.get("cart", [])]) or "—"
-            resumo = (
-                "🧾 *Resumo do Pedido*\n"
-                f"👤 Nome: {data.get('nome','')}\n"
-                f"📞 Telefone: {data.get('telefone_cliente','')}\n"
-                f"🧭 Perfil: {data.get('perfil','')}\n"
-                f"🏢 Empresa: {data.get('empresa','')}\n"
-                f"🆔 CNPJ: {data.get('cnpj','')}\n"
-                f"📍 Cidade: {data.get('cidade','')}\n"
-                f"🏠 Rua: {data.get('rua','')}\n"
-                f"🏘️ Bairro: {data.get('bairro','')}\n"
-                f"📮 CEP: {data.get('cep','')}\n"
-                f"✉️ E-mail: {data.get('email','')}\n"
-                f"🧺 Itens:\n{carrinho}\n"
-                f"🧩 Auxílio técnico: {data.get('auxilio_tecnico','')}\n"
-                f"🪪 Código do Pedido: *{order_code}*\n\n"
-                "Um atendente entrará em contato para confirmar os detalhes. Obrigado!"
-            )
-            return prefix + resumo
 
     # ========== ATENDIMENTO ==========
     if mode == "atendimento":
