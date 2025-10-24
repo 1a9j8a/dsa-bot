@@ -31,24 +31,69 @@ KNOWN_NAMES: dict[str, str] = {} # armazena primeiro nome por telefone (quando v
 IDLE_NUDGE_SECONDS = 600         # 10min
 
 # ==============================
-# MÓDULO 2 — LINHA DE PRODUTOS REZYMOL
+# HELPERS
 # ==============================
-def produtos_menu_text() -> str:
-    return (
-        "Conheça nossa *Linha Rezymol – Setor Moveleiro* 🪵\n\n"
-        "• Fluido Antiaderente (coladeiras de borda)\n"
-        "• Fluido Resfriador (coladeiras de borda)\n"
-        "• Fluido Antiestático (coladeiras de borda)\n"
-        "• Fluido Finalizador (coladeiras de borda)\n"
-        "• Limpa Chapas / Remoção de Colas\n"
-        "• Limpa Chapas / Peças / Finalizador\n"
-        "• Limpa Coleiros\n"
-        "• Desengraxantes Protetivo e Mãos\n"
-        "• Removedor de Resinas\n"
-        "• Removedor de Tintas Anilox\n\n"
-        "📘 *Para solicitar catálogo*, digite *catálogo* ou *3*.\n\n"
-        "🛒 *Para realizar um pedido*, digite *compra* ou *2*."
-    )
+def generate_order_code(phone: str) -> str:
+    """Gera um código único para o pedido com base no telefone e data."""
+    date_str = datetime.now().strftime("%Y%m%d")
+    short_phone = (re.sub(r"\D", "", phone)[-4:] if phone else "0000")
+    seq = str(int(time.time()) % 1000).zfill(3)
+    return f"PED-{short_phone}-{date_str}-{seq}"
+
+def first_name_from_sender(sender: str | None) -> str | None:
+    if not sender:
+        return None
+    s = sender.strip()
+    # pega a primeira "palavra" antes de emoji/separadores
+    s = re.split(r"[^\wÀ-ÖØ-öø-ÿ'-]+", s)[0]
+    return s if s else None
+
+def greeting_match(tl: str) -> bool:
+    return any(kw in tl for kw in (
+        "oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "menu", "inicio", "start", "spark"
+    ))
+
+def ensure_session(phone: str):
+    SESSIONS.setdefault(phone, {"stage": None, "mode": None, "data": {}, "last": time.time()})
+    SESSIONS[phone]["last"] = time.time()
+
+def maybe_idle_nudge(phone: str) -> str | None:
+    sess = SESSIONS.get(phone)
+    if not sess:
+        return None
+    last = sess.get("last", time.time())
+    if time.time() - last > IDLE_NUDGE_SECONDS and sess.get("stage") not in (None, "done"):
+        SESSIONS[phone]["last"] = time.time()
+        return "Entendi! Pode me contar qual é a sua dúvida? Estou aqui pra te ajudar 👍"
+    return None
+
+def save_lead(data: dict, phone: str, mode: str = "atendimento"):
+    file_exists = LEADS_CSV.exists()
+    with LEADS_CSV.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "telefone", "nome", "telefone_cliente", "perfil", "empresa", "cnpj",
+                "cidade", "rua", "bairro", "cep", "email", "modo", "auxilio_tecnico"
+            ]
+        )
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            "telefone": phone,
+            "nome": data.get("nome", ""),
+            "telefone_cliente": data.get("telefone_cliente", ""),
+            "perfil": data.get("perfil", ""),
+            "empresa": data.get("empresa", ""),
+            "cnpj": data.get("cnpj", ""),
+            "cidade": data.get("cidade", ""),
+            "rua": data.get("rua", ""),
+            "bairro": data.get("bairro", ""),
+            "cep": data.get("cep", ""),
+            "email": data.get("email", ""),
+            "modo": mode,
+            "auxilio_tecnico": data.get("auxilio_tecnico", ""),
+        })
 
 # ==============================
 # ENVIO VIA Z-API
@@ -72,7 +117,7 @@ async def send_file_via_zapi(phone: str, file_url: str, file_name: str = "", cap
     return r.status_code, r.text
 
 # ==============================
-# BOAS-VINDAS (MÓDULO 1 — MENU PRINCIPAL)
+# MÓDULO 1 — BOAS-VINDAS / MENU
 # ==============================
 def welcome_text(first_name: str | None = None) -> str:
     saudacao = "Olá! 😊 Tudo bem?"
@@ -91,107 +136,31 @@ def welcome_text(first_name: str | None = None) -> str:
     )
 
 # ==============================
-# AUXILIARES
+# MÓDULO 2 — LINHA DE PRODUTOS REZYMOL
 # ==============================
-def greeting_match(tl: str) -> bool:
-    return any(kw in tl for kw in (
-        "oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "menu", "inicio", "start", "spark"
-    ))
-
-def first_name_from_sender(sender: str | None) -> str | None:
-    if not sender:
-        return None
-    s = sender.strip()
-    # pega a primeira palavra antes de emoji etc.
-    s = re.split(r"[^\wÀ-ÖØ-öø-ÿ'-]+", s)[0]
-    return s if s else None
-
-def save_lead(data: dict, phone: str, mode: str = "atendimento"):
-    file_exists = LEADS_CSV.exists()
-    with LEADS_CSV.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "telefone", "nome", "telefone_cliente", "perfil", "empresa", "cnpj",
-                "cidade", "rua", "bairro", "cep", "email", "modo", "itens", "auxilio_tecnico"
-            ]
-        )
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow({
-            "telefone": phone,
-            "nome": data.get("nome", ""),
-            "telefone_cliente": data.get("telefone_cliente", ""),
-            "perfil": data.get("perfil", ""),
-            "empresa": data.get("empresa", ""),
-            "cnpj": data.get("cnpj", ""),
-            "cidade": data.get("cidade", ""),
-            "rua": data.get("rua", ""),
-            "bairro": data.get("bairro", ""),
-            "cep": data.get("cep", ""),
-            "email": data.get("email", ""),
-            "modo": mode,
-            "itens": "; ".join([f"{i['code']} x{i['qty']}" for i in data.get("cart", [])]) if data.get("cart") else "",
-            "auxilio_tecnico": data.get("auxilio_tecnico", ""),
-        })
-
-def ensure_session(phone: str):
-    SESSIONS.setdefault(phone, {"stage": None, "mode": None, "data": {}, "last": time.time()})
-    SESSIONS[phone]["last"] = time.time()
-
-def maybe_idle_nudge(phone: str) -> str | None:
-    sess = SESSIONS.get(phone)
-    if not sess:
-        return None
-    last = sess.get("last", time.time())
-    if time.time() - last > IDLE_NUDGE_SECONDS and sess.get("stage") not in (None, "done"):
-        SESSIONS[phone]["last"] = time.time()
-        return "Entendi! Pode me contar qual é a sua dúvida? Estou aqui pra te ajudar 👍"
-    return None
-
-# ==============================
-# PARSE DE ITENS (NÚMERO/ CÓDIGO + QUANTIDADE)
-# ==============================
-def parse_items_line(line: str) -> list[dict]:
-    """
-    Aceita formatos:
-      - "1x2, 4x1"
-      - "1 x 2; 3x5"
-      - "982 NI x2, 983 FI x1"
-    Retorna lista de dicts: {"code": "...", "qty": int}
-    """
-    out = []
-
-    # 1) Por número (id do menu): ex. 1x2
-    for part in re.split(r"[;,]+", line):
-        part = part.strip()
-        m = re.match(r"^\s*(\d{1,2})\s*x\s*(\d{1,3})\s*$", part, re.IGNORECASE)
-        if m:
-            idx, qty = m.group(1), int(m.group(2))
-            if idx in PRODUCTS and qty > 0:
-                out.append({"code": PRODUCTS[idx]["code"], "qty": qty})
-
-    # 2) Por código (texto + xqtd): ex. "982 NI x2"
-    #    captura até 'x', depois a quantidade
-    for code, qty in re.findall(r"([A-Za-z0-9 ]{2,20})\s*x\s*(\d{1,3})", line, re.IGNORECASE):
-        code = code.strip().upper()
-        # tenta casar com tabela (por code):
-        valid_code = None
-        for p in PRODUCTS.values():
-            if code == p["code"].upper():
-                valid_code = p["code"]
-                break
-        if valid_code and int(qty) > 0:
-            out.append({"code": valid_code, "qty": int(qty)})
-
-    return out
+def produtos_menu_text() -> str:
+    return (
+        "Conheça nossa *Linha Rezymol – Setor Moveleiro* 🪵\n\n"
+        "• Fluido Antiaderente (coladeiras de borda)\n"
+        "• Fluido Resfriador (coladeiras de borda)\n"
+        "• Fluido Antiestático (coladeiras de borda)\n"
+        "• Fluido Finalizador (coladeiras de borda)\n"
+        "• Limpa Chapas / Remoção de Colas\n"
+        "• Limpa Chapas / Peças / Finalizador\n"
+        "• Limpa Coleiros\n"
+        "• Desengraxantes Protetivo e Mãos\n"
+        "• Removedor de Resinas\n"
+        "• Removedor de Tintas Anilox\n\n"
+        "📘 *Para solicitar catálogo*, digite *catálogo* ou *3*.\n\n"
+        "🛒 *Para realizar um pedido*, digite *compra* ou *2*."
+    )
 
 # ==============================
 # FLUXOS
 # ==============================
 def start_flow(phone: str, mode: str):
     ensure_session(phone)
-    SESSIONS[phone].update({"mode": mode, "stage": "ask_name", "data": {"cart": []}})
+    SESSIONS[phone].update({"mode": mode, "stage": "ask_name", "data": {}})
     if mode == "compra":
         return "🛒 Vamos registrar seu pedido! Qual é o seu *nome*?"
     if mode == "catalogo":
@@ -263,10 +232,9 @@ def continue_flow(phone: str, text: str) -> str:
         m = re.search(r"\b\d{8}\b", text)
         data["cep"] = (m.group(0) if m else re.sub(r"\D", "", text))
         if mode == "catalogo":
-            # catálogo exige até cidade, mas vamos aproveitar endereço se deu
             sess["stage"] = "ask_email_catalogo"
-            return prefix + "Por fim, seu *e-mail* para enviar também as informações."
-        # compra segue
+            return prefix + "Por fim, seu *e-mail* para envio do catálogo."
+        # compra / atendimento seguem para e-mail
         sess["stage"] = "ask_email"
         return prefix + "Por fim, seu *e-mail* de contato."
 
@@ -276,7 +244,6 @@ def continue_flow(phone: str, text: str) -> str:
             data["email"] = text.strip()
             sess["stage"] = "done"
             save_lead(data, phone, "catalogo")
-
             resumo = (
                 "✅ Dados recebidos! Enviarei o *Catálogo Rezymol* em seguida.\n"
                 f"Resumo: *{data.get('nome','')}*, *{data.get('empresa','')}*, *{data.get('cnpj','')}*, "
@@ -287,31 +254,29 @@ def continue_flow(phone: str, text: str) -> str:
 
     # ========== COMPRA ==========
     if mode == "compra":
-        if stage == "ask_email":
-    session["data"]["email"] = text.strip()
-    order_code = generate_order_code(phone)
-    session["stage"] = "done"
-    save_lead(session["data"], phone, mode)
-    SESSIONS.pop(phone, None)
+        if sess["stage"] == "ask_email":
+            data["email"] = text.strip()
+            order_code = generate_order_code(phone)
+            sess["stage"] = "done"
+            save_lead(data, phone, "compra")
+            SESSIONS.pop(phone, None)
 
-    resumo = (
-        f"🧾 *Pedido registrado com sucesso!* Código: *{order_code}*\n\n"
-        f"👤 *Nome:* {session['data'].get('nome','')}\n"
-        f"🏢 *Empresa:* {session['data'].get('empresa','')}\n"
-        f"🆔 *CNPJ:* {session['data'].get('cnpj','')}\n"
-        f"📍 *Cidade:* {session['data'].get('cidade','')}\n"
-        f"📞 *Telefone:* {session['data'].get('telefone','')}\n"
-        f"📦 *Endereço de entrega:* {session['data'].get('endereco','')}\n"
-        f"✉️ *E-mail:* {session['data'].get('email','')}\n\n"
-        "✅ Obrigado por confiar na *DSA Cristal Química*!\n"
-        "Em instantes, um atendente entrará em contato para confirmar os detalhes do seu pedido. 🙌"
-    )
-    return resumo
-
+            resumo = (
+                f"🧾 *Pedido registrado com sucesso!* Código: *{order_code}*\n\n"
+                f"👤 *Nome:* {data.get('nome','')}\n"
+                f"🏢 *Empresa:* {data.get('empresa','')}\n"
+                f"🆔 *CNPJ:* {data.get('cnpj','')}\n"
+                f"📍 *Cidade:* {data.get('cidade','')}\n"
+                f"📞 *Telefone:* {data.get('telefone_cliente','')}\n"
+                f"📦 *Endereço de entrega:* {data.get('rua','')} - {data.get('bairro','')} - CEP {data.get('cep','')}\n"
+                f"✉️ *E-mail:* {data.get('email','')}\n\n"
+                "✅ Obrigado por confiar na *DSA Cristal Química*!\n"
+                "Em instantes, um atendente entrará em contato para confirmar os detalhes do seu pedido. 🙌"
+            )
+            return resumo
 
     # ========== ATENDIMENTO ==========
     if mode == "atendimento":
-        # depois do endereço, já fechamos no ask_cep
         if sess["stage"] == "ask_email":
             data["email"] = text.strip()
             sess["stage"] = "done"
@@ -347,16 +312,20 @@ def route_message(phone: str, text: str) -> str:
         return produtos_menu_text()
     if tl.startswith("2") or "compra" in tl:
         return start_flow(phone, "compra")
-    if tl.startswith("3") or "catálogo" in tl or "catalogo" in tl:
-        return start_flow(phone, "catalogo")
-    if tl.startswith("4") or "atendente" in tl or "humano" in tl:
+    if tl.startswith("3") or "representante" in tl:
+        return "Nossa equipe comercial entrará em contato. Para agilizar, digite *5* para falar com um atendente."
+    if tl.startswith("4") or "fornecedor" in tl or "matéria prima" in tl or "materia prima" in tl:
+        return "Se você é fornecedor de matéria-prima, deixe seu *nome, empresa, e e-mail* e o setor de compras retornará."
+    if tl.startswith("5") or "atendente" in tl or "humano" in tl or "especialista" in tl:
         return start_flow(phone, "atendimento")
-    if tl.startswith("5") or "auxílio técnico" in tl or "auxilio tecnico" in tl:
-        return "Posso te orientar na escolha do produto ideal. Diga qual equipamento/processo e o tipo de sujidade/resíduo que deseja resolver."
 
     # Produtos / Rezymol palavras-chave
     if "rezymol" in tl or "produtos" in tl:
         return produtos_menu_text()
+
+    # Catálogo por palavra-chave
+    if "catálogo" in tl or "catalogo" in tl:
+        return start_flow(phone, "catalogo")
 
     return "⚡ Digite *menu* para ver as opções ou *compra* para iniciar seu pedido."
 
