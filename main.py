@@ -180,7 +180,7 @@ def continue_flow(phone: str, text: str) -> str:
     prefix = f"{nudge}\n\n" if nudge else ""
 
     # ========== ETAPAS COMUNS ==========
-     if sess["stage"] == "ask_name":
+    if sess["stage"] == "ask_name":
         data["nome"] = text.strip()
         sess["stage"] = "ask_phone"
         return prefix + "Por favor, informe seu *telefone* com DDD."
@@ -197,7 +197,12 @@ def continue_flow(phone: str, text: str) -> str:
         )
 
     if sess["stage"] == "ask_profile":
-        perfis = {"1": "Representante", "2": "Cliente", "3": "Distribuidor", "4": "Fornecedor de Produtos - Matéria Prima"}
+        perfis = {
+            "1": "Representante",
+            "2": "Cliente",
+            "3": "Distribuidor",
+            "4": "Fornecedor de Produtos - Matéria Prima",
+        }
         data["perfil"] = perfis.get(tl, text.strip())
         sess["stage"] = "ask_company"
         return prefix + "Qual é o nome da *empresa*?"
@@ -243,7 +248,6 @@ def continue_flow(phone: str, text: str) -> str:
         sess["stage"] = "ask_email"
         return prefix + "Por fim, seu *e-mail* de contato."
 
-
     # ========== CATÁLOGO ==========
     if mode == "catalogo":
         if sess["stage"] == "ask_email_catalogo":
@@ -252,34 +256,61 @@ def continue_flow(phone: str, text: str) -> str:
             save_lead(data, phone, "catalogo")
             resumo = (
                 "✅ Dados recebidos! Enviarei o *Catálogo Rezymol* em seguida.\n"
-                f"Resumo: *{data.get('nome','')}*, *{data.get('empresa','')}*, *{data.get('cnpj','')}*, "
-                f"*{data.get('cidade','')}*."
+                f"Resumo: *{data.get('nome','')}*, *{data.get('empresa','')}*, "
+                f"*{data.get('cnpj','')}*, *{data.get('cidade','')}*."
             )
-            # marcador para o endpoint enviar o arquivo
             return f"{resumo}\n__SEND_CATALOG_AFTER_LEAD__:rezymol"
 
     # ========== COMPRA ==========
     if mode == "compra":
         if sess["stage"] == "ask_email":
             data["email"] = text.strip()
-            order_code = generate_order_code(phone)
-            sess["stage"] = "done"
-            save_lead(data, phone, "compra")
-            SESSIONS.pop(phone, None)
-
-            resumo = (
-                f"🧾 *Pedido registrado com sucesso!* Código: *{order_code}*\n\n"
-                f"👤 *Nome:* {data.get('nome','')}\n"
-                f"🏢 *Empresa:* {data.get('empresa','')}\n"
-                f"🆔 *CNPJ:* {data.get('cnpj','')}\n"
-                f"📍 *Cidade:* {data.get('cidade','')}\n"
-                f"📞 *Telefone:* {data.get('telefone_cliente','')}\n"
-                f"📦 *Endereço de entrega:* {data.get('rua','')} - {data.get('bairro','')} - CEP {data.get('cep','')}\n"
-                f"✉️ *E-mail:* {data.get('email','')}\n\n"
-                "✅ Obrigado por confiar na *DSA Cristal Química*!\n"
-                "Em instantes, um atendente entrará em contato para confirmar os detalhes do seu pedido. 🙌"
+            # Aqui você pode continuar para etapa de itens/carrinho, ou finalizar
+            # Exemplo: seguir direto para itens
+            sess["stage"] = "ask_items"
+            return prefix + (
+                "Perfeito! Agora me diga quais *produtos e quantidades* você quer.\n"
+                "Ex.: 1x2, 4x1 ou 982 NI x2, 983 FI x1.\n"
+                "Quando terminar, digite *finalizar*."
             )
-            return resumo
+
+        if sess["stage"] == "ask_items":
+            if tl == "finalizar":
+                # Finaliza o pedido
+                order_code = f"PED-{phone[-4:] if phone else '0000'}-{datetime.now().strftime('%Y%m%d')}-{str(len(SESSIONS)+1).zfill(3)}"
+                sess["stage"] = "done"
+                save_lead(data, phone, "compra")
+                SESSIONS.pop(phone, None)
+                # Monta endereço label conforme perfil
+                end_label = "Endereço comercial" if data.get("perfil","").lower().startswith("represent") else "Endereço de entrega"
+                resumo = (
+                    f"🧾 *Pedido registrado com sucesso!* Código: *{order_code}*\n\n"
+                    f"👤 *Nome:* {data.get('nome','')}\n"
+                    f"🏢 *Empresa:* {data.get('empresa','')}\n"
+                    f"🆔 *CNPJ:* {data.get('cnpj','')}\n"
+                    f"📍 *Cidade:* {data.get('cidade','')}\n"
+                    f"📞 *Telefone:* {data.get('telefone_cliente','')}\n"
+                    f"📦 *{end_label}:* {data.get('rua','')}, {data.get('bairro','')}, CEP {data.get('cep','')}\n"
+                    f"✉️ *E-mail:* {data.get('email','')}\n\n"
+                    "✅ Obrigado por confiar na *DSA Cristal Química*!\n"
+                    "Em instantes, um atendente entrará em contato para confirmar os detalhes do seu pedido. 🙌"
+                )
+                return resumo
+
+            # parse dos itens
+            items = parse_items_line(text)
+            if not items:
+                return prefix + (
+                    "Não reconheci os itens. Tente no formato *1x2, 4x1* ou *982 NI x2*.\n"
+                    "Quando terminar, digite *finalizar*."
+                )
+            data.setdefault("cart", [])
+            data["cart"].extend(items)
+            carrinho = "; ".join([f"{i['code']} x{i['qty']}" for i in data["cart"]])
+            return prefix + (
+                f"🛒 Itens adicionados: {carrinho}\n"
+                "Pode adicionar mais itens ou digitar *finalizar*."
+            )
 
     # ========== ATENDIMENTO ==========
     if mode == "atendimento":
@@ -295,6 +326,7 @@ def continue_flow(phone: str, text: str) -> str:
 
     # fallback
     return prefix + "Pode repetir, por favor?"
+
 
 # ==============================
 # ROTEAMENTO DE MENSAGENS
