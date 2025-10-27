@@ -342,6 +342,7 @@ def continue_flow(phone: str, text: str) -> str:
         return prefix + "Por fim, seu *e-mail* de contato."
 
     # --------- CATÁLOGO ---------
+    # CATÁLOGO
     if mode == "catalogo":
         if sess["stage"] == "ask_email_catalogo":
             data["email"] = text.strip()
