@@ -345,18 +345,7 @@ def continue_flow(phone: str, text: str) -> str:
     # CATÁLOGO
     if mode == "catalogo":
         if sess["stage"] == "ask_email_catalogo":
-            data["email"] = text.strip()
-            sess["stage"] = "done"
-            save_lead(data, phone, "catalogo")
-
-            resumo = (
-                "✅ Dados recebidos! Enviarei o *Catálogo Rezymol* agora.\n"
-                f"Resumo: *{data.get('nome','')}*, *{data.get('empresa','')}*, *{data.get('cnpj','')}*.\n"
-                "Você também receberá por e-mail (se informado)."
-            )
-            # marcador p/ o endpoint enviar WhatsApp + e-mail
-            return f"{resumo}\n__SEND_CATALOG_AFTER_LEAD__:rezymol"
-
+           
     # --------- COMPRA ---------
     if mode == "compra":
         if sess["stage"] == "ask_email":
