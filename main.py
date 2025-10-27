@@ -2,13 +2,11 @@ import os
 import csv
 import re
 import time
-import smtplib
-from email.message import EmailMessage
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
 from dotenv import load_dotenv
 
@@ -18,32 +16,31 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ZAPI_BASE = os.getenv("ZAPI_BASE", "https://api.z-api.io")
-INSTANCE_ID = os.getenv("ZAPI_INSTANCE_ID")
-TOKEN = os.getenv("ZAPI_TOKEN")
-CLIENT_TOKEN = os.getenv("CLIENT_TOKEN") or os.getenv("ZAPI_CLIENT_TOKEN")
+INSTANCE_ID = os.getenv("ZAPI_INSTANCE_ID", "")
+TOKEN = os.getenv("ZAPI_TOKEN", "")
+CLIENT_TOKEN = os.getenv("CLIENT_TOKEN", "") or os.getenv("ZAPI_CLIENT_TOKEN", "")
 
+# Link do catálogo (PDF/arquivo público acessível)
 CATALOG_REZYMOL_URL = os.getenv("CATALOG_REZYMOL_URL", "")
-
-# SMTP (opcional p/ envio por e-mail do catálogo)
-SMTP_HOST = os.getenv("SMTP_HOST", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587") or "587")
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-SMTP_FROM = os.getenv("SMTP_FROM", "")
 
 app = FastAPI(title="DSA Bot - Spark")
 
 # ==============================
 # VARIÁVEIS GLOBAIS
 # ==============================
-SESSIONS: dict[str, dict] = {}            # estado por telefone
+SESSIONS: dict[str, dict] = {}           # estado por telefone
 LEADS_CSV = Path("leads.csv")
-KNOWN_NAMES: dict[str, str] = {}          # primeiro nome por telefone
-LAST_LEAD_BY_PHONE: dict[str, dict] = {}  # último lead salvo (p/ catálogo/e-mail)
-IDLE_NUDGE_SECONDS = 600                  # 10min
+KNOWN_NAMES: dict[str, str] = {}         # primeiro nome por telefone
+IDLE_NUDGE_SECONDS = 600                 # 10min
+
+# Palavras-chave que disparam saudação/menu
+GREET_TOKENS = {
+    "oi", "olá", "ola", "oie", "hey", "hi", "hello", "bom dia", "boa tarde", "boa noite",
+    "menu", "início", "inicio", "começar", "comecar", "start", "help", "ajuda"
+}
 
 # ==============================
-# PRODUTOS (VISUAL)
+# TEXTOS PRONTOS
 # ==============================
 def produtos_menu_text() -> str:
     return (
@@ -62,9 +59,6 @@ def produtos_menu_text() -> str:
         "🛒 *Para comprar agora*, digite *2* ou *compra*."
     )
 
-# ==============================
-# MENSAGEM DE BOAS-VINDAS (MENU)
-# ==============================
 def welcome_text(first_name: str | None = None) -> str:
     saudacao = "Olá! 😊 Tudo bem?"
     prazer = f" Prazer em te conhecer, {first_name}!" if first_name else ""
@@ -83,94 +77,59 @@ def welcome_text(first_name: str | None = None) -> str:
 # ==============================
 # ENVIO VIA Z-API
 # ==============================
-# ==============================
-# ENVIO DE TEXTO VIA Z-API
-# ==============================
+def zapi_base_url() -> str:
+    return f"{ZAPI_BASE}/instances/{INSTANCE_ID}/token/{TOKEN}"
+
 async def send_text_via_zapi(phone: str, message: str):
     """
-    Envia mensagem de texto tentando múltiplos endpoints e formatos de payload da Z-API.
-    Só trata como sucesso quando NÃO houver 'error' no JSON de resposta.
-    Retorna (status_code, response_text).
+    Envia mensagem de texto via Z-API.
     """
-    headers = {"Client-Token": os.getenv("CLIENT_TOKEN") or os.getenv("ZAPI_CLIENT_TOKEN", "")}
-    base = f"{ZAPI_BASE}/instances/{INSTANCE_ID}/token/{TOKEN}"
+    url = f"{zapi_base_url()}/send-text"
+    headers = {"Client-Token": CLIENT_TOKEN} if CLIENT_TOKEN else {}
+    payload = {"phone": phone, "message": message}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, json=payload, headers=headers)
+        print(f"<== STATUS DE ENVIO DE TEXTO Z-API : {r.status_code} | RESP: {r.text}")
+        return r.status_code, r.text
 
-    # Variações de payload que já vi em diferentes planos/versões:
-    candidate_payloads = [
-        {"phone": phone, "message": message},
-        {"phone": phone, "text": message},
-        {"to": phone, "message": message},
-        {"to": phone, "text": message},
-    ]
+async def send_file_via_zapi(phone: str, file_url: str, file_name: str = "", caption: str = ""):
+    """
+    Tenta enviar arquivo por diferentes endpoints da Z-API, pois variam por plano/versão:
+      1) /send-file
+      2) /send-file-from-url
+      3) /send-document
+    Usa o primeiro que funcionar (status < 300). Loga a resposta de cada tentativa.
+    """
+    headers = {"Client-Token": CLIENT_TOKEN} if CLIENT_TOKEN else {}
+    base = zapi_base_url()
 
-    # Variações de endpoint que a Z-API usa em planos diferentes:
+    payload = {"phone": phone, "file": file_url}
+    if file_name:
+        payload["fileName"] = file_name
+    if caption:
+        payload["caption"] = caption
+
     endpoints = [
-        "send-text",
-        "send-message",
-        "send-text-message",
-        "send-message-text",
-        "send-text-to-number",
+        "send-file",
+        "send-file-from-url",
+        "send-document",
     ]
 
     async with httpx.AsyncClient(timeout=40) as client:
         last_status, last_text = None, None
         for ep in endpoints:
             url = f"{base}/{ep}"
-            for payload in candidate_payloads:
-                try:
-                    r = await client.post(url, json=payload, headers=headers)
-                    body_text = r.text
-                    print(f"<== Z-API TRY {ep} STATUS: {r.status_code} | RESP: {body_text}")
-
-                    ok = False
-                    try:
-                        j = r.json()
-                        ok = (r.status_code < 300) and (not j.get("error"))
-                    except Exception:
-                        ok = (r.status_code < 300) and ("error" not in body_text.lower())
-
-                    if ok:
-                        return r.status_code, body_text
-
-                    last_status, last_text = r.status_code, body_text
-
-                except Exception as e:
-                    print(f"<== Z-API TRY {ep} EXC: {repr(e)}")
-                    last_status, last_text = 599, repr(e)
-
-        return last_status or 500, last_text or "Falha ao enviar texto"
-
-# ==============================
-# ENVIO POR E-MAIL (OPCIONAL)
-# ==============================
-def send_catalog_email(to_email: str, subject: str, body: str, attachment_url: str | None = None):
-    """
-    Envia e-mail simples com link do catálogo (ou anexo se futuramente baixar).
-    Só executa se SMTP_* estiver configurado. Caso contrário, não faz nada.
-    """
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and SMTP_FROM and to_email):
-        print("[EMAIL] SMTP não configurado ou e-mail de destino vazio. Pulando envio por e-mail.")
-        return False
-
-    msg = EmailMessage()
-    msg["From"] = SMTP_FROM
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    texto = body
-    if attachment_url:
-        texto += f"\n\nLink do catálogo: {attachment_url}"
-    msg.set_content(texto)
-
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
-        print("[EMAIL] Enviado com sucesso para", to_email)
-        return True
-    except Exception as e:
-        print("[EMAIL] Falha ao enviar:", repr(e))
-        return False
+            try:
+                r = await client.post(url, json=payload, headers=headers)
+                print(f"<== Z-API TRY {ep} STATUS: {r.status_code} | RESP: {r.text}")
+                if r.status_code < 300:
+                    return r.status_code, r.text
+                last_status, last_text = r.status_code, r.text
+            except Exception as e:
+                print(f"<== Z-API TRY {ep} EXC: {repr(e)}")
+                last_status, last_text = 599, repr(e)
+        # se chegou aqui, nenhuma rota funcionou
+        return last_status or 500, last_text or "Falha ao enviar arquivo"
 
 # ==============================
 # AUXILIARES
@@ -200,30 +159,26 @@ def save_lead(data: dict, phone: str, mode: str = "atendimento"):
     file_exists = LEADS_CSV.exists()
     fields = ["telefone", "nome", "telefone_cliente", "perfil", "empresa", "cnpj",
               "endereco", "email", "modo", "itens"]
-    row = {
-        "telefone": phone,
-        "nome": data.get("nome", ""),
-        "telefone_cliente": data.get("telefone_cliente", ""),
-        "perfil": data.get("perfil", ""),
-        "empresa": data.get("empresa", ""),
-        "cnpj": data.get("cnpj", ""),
-        "endereco": data.get("endereco", ""),
-        "email": data.get("email", ""),
-        "modo": mode,
-        "itens": "; ".join([f"{i['desc']} x{i['qty']}" for i in data.get("cart", [])]) if data.get("cart") else "",
-    }
     with LEADS_CSV.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         if not file_exists:
             writer.writeheader()
-        writer.writerow(row)
-    # mantém na memória para uso imediato (envio catálogo/e-mail)
-    LAST_LEAD_BY_PHONE[phone] = {**data, "modo": mode}
+        writer.writerow({
+            "telefone": phone,
+            "nome": data.get("nome", ""),
+            "telefone_cliente": data.get("telefone_cliente", ""),
+            "perfil": data.get("perfil", ""),
+            "empresa": data.get("empresa", ""),
+            "cnpj": data.get("cnpj", ""),
+            "endereco": data.get("endereco", ""),
+            "email": data.get("email", ""),
+            "modo": mode,
+            "itens": "; ".join([f"{i['desc']} x{i['qty']}" for i in data.get("cart", [])]) if data.get("cart") else "",
+        })
 
 def generate_order_code(phone: str) -> str:
     date_str = datetime.now().strftime("%Y%m%d")
     short_phone = phone[-4:] if phone else "0000"
-    # contador simples por tamanho da sessão atual
     return f"PED-{short_phone}-{date_str}-{str(len(SESSIONS) + 1).zfill(3)}"
 
 # ==============================
@@ -253,8 +208,6 @@ def parse_items_free_text(line: str) -> list[dict]:
     out = []
     parts = re.split(r"[;,]\s*", line)
     for part in parts:
-        if not part.strip():
-            continue
         m = re.search(r"x\s*(\d{1,3})", part, re.IGNORECASE)
         qty = int(m.group(1)) if m else 1
         found = None
@@ -293,7 +246,7 @@ def continue_flow(phone: str, text: str) -> str:
     nudge = maybe_idle_nudge(phone)
     prefix = f"{nudge}\n\n" if nudge else ""
 
-    # --------- COMUM ---------
+    # COMUM
     if sess["stage"] == "ask_name":
         data["nome"] = text.strip()
         sess["stage"] = "ask_phone"
@@ -311,7 +264,12 @@ def continue_flow(phone: str, text: str) -> str:
         )
 
     if sess["stage"] == "ask_profile":
-        perfis = {"1": "Representante", "2": "Cliente", "3": "Distribuidor", "4": "Fornecedor de Produtos - Matéria Prima"}
+        perfis = {
+            "1": "Representante",
+            "2": "Cliente",
+            "3": "Distribuidor",
+            "4": "Fornecedor de Produtos - Matéria Prima",
+        }
         data["perfil"] = perfis.get(tl, text.strip())
         sess["stage"] = "ask_company"
         return prefix + "Qual é o nome da *empresa*?"
@@ -336,17 +294,33 @@ def continue_flow(phone: str, text: str) -> str:
         data["endereco"] = text.strip()
         if mode == "catalogo":
             sess["stage"] = "ask_email_catalogo"
-            return prefix + "Por fim, seu *e-mail* para envio do catálogo."
+            return prefix + "Por fim, seu *e-mail* para registro (opcional)."
         # compra e atendimento seguem para e-mail
         sess["stage"] = "ask_email"
-        return prefix + "Por fim, seu *e-mail* de contato."
+        return prefix + "Por fim, seu *e-mail* de contato (opcional)."
 
-    # --------- CATÁLOGO ---------
-    # CATÁLOGO
+    # ==============================
+    # CATÁLOGO (envio SÓ via WhatsApp)
+    # ==============================
     if mode == "catalogo":
         if sess["stage"] == "ask_email_catalogo":
-           
-    # --------- COMPRA ---------
+            data["email"] = text.strip()  # apenas registro/CSV
+            sess["stage"] = "done"
+            save_lead(data, phone, "catalogo")
+
+            resumo = (
+                "✅ Dados recebidos! Estou enviando agora o *Catálogo Rezymol* diretamente por aqui. 📲\n\n"
+                f"👤 *Nome:* {data.get('nome','')}\n"
+                f"🏢 *Empresa:* {data.get('empresa','')}\n"
+                f"🆔 *CNPJ:* {data.get('cnpj','')}\n"
+                "Se precisar de ajuda com algum produto ou cotação, é só me avisar! 💬"
+            )
+            # Flag para o webhook enviar o arquivo via WhatsApp com send_file_via_zapi
+            return f"{resumo}\n__SEND_CATALOG_AFTER_LEAD__:rezymol"
+
+    # ==============================
+    # COMPRA
+    # ==============================
     if mode == "compra":
         if sess["stage"] == "ask_email":
             data["email"] = text.strip()
@@ -361,13 +335,15 @@ def continue_flow(phone: str, text: str) -> str:
 
         if sess["stage"] == "ask_items":
             if tl == "finalizar":
+                # finalizar pedido
                 order_code = generate_order_code(phone)
                 sess["stage"] = "done"
                 save_lead(data, phone, "compra")
 
                 itens_str = (
                     "\n".join([f"• {i['desc']} x{i['qty']}" for i in data.get("cart", [])])
-                    if data.get("cart") else "—"
+                    if data.get("cart")
+                    else "—"
                 )
 
                 resumo = (
@@ -384,18 +360,24 @@ def continue_flow(phone: str, text: str) -> str:
                 )
                 return resumo
 
+            # tentar adicionar itens da linha
             parsed = parse_items_free_text(text)
             if parsed:
                 data.setdefault("cart", []).extend(parsed)
                 added = "\n".join([f"• {i['desc']} x{i['qty']}" for i in parsed])
-                return prefix + f"Adicionei ao carrinho:\n{added}\n\nSe quiser, envie mais itens. Para encerrar, digite *finalizar*."
+                return (
+                    prefix
+                    + f"Adicionei ao carrinho:\n{added}\n\nSe quiser, envie mais itens. Para encerrar, digite *finalizar*."
+                )
             else:
                 return prefix + (
                     "Não consegui identificar itens nessa mensagem.\n"
                     "Envie no formato: *Produto x2* (separando por vírgulas ou ponto e vírgula)."
                 )
 
-    # --------- ATENDIMENTO ---------
+    # ==============================
+    # ATENDIMENTO
+    # ==============================
     if mode == "atendimento":
         if sess["stage"] == "ask_email":
             data["email"] = text.strip()
@@ -406,160 +388,112 @@ def continue_flow(phone: str, text: str) -> str:
                 f"Resumo: *{data.get('nome','')}*, *{data.get('empresa','')}*, *{data.get('endereco','')}*."
             )
 
-    # fallback se nada casou
+    # fallback
     return prefix + "Pode repetir, por favor? Digite *menu* para ver as opções."
 
 # ==============================
-# ROTEAMENTO DE MENSAGENS
+# ROUTES
 # ==============================
-def greeting_match(tl: str) -> bool:
-    # aciona o menu para "oi", saudações, ou qualquer primeira mensagem fora de fluxo
-    greetings = ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "menu", "inicio", "start", "spark", "help", "?"]
-    return any(g in tl for g in greetings)
+@app.get("/")
+async def root():
+    return PlainTextResponse("DSA Bot - Spark ativo. Use POST /api/webhook/receber.")
 
-def route_message(phone: str, text: str) -> str:
-    ensure_session(phone)
-    t = (text or "").strip()
-    tl = t.lower()
-
-    # Se já está em um fluxo, não processa atalhos/menus para evitar duplicar etapas
-    if SESSIONS.get(phone, {}).get("stage") not in (None, "done"):
-        return continue_flow(phone, t)
-
-    # Saudações / primeira mensagem -> sempre mostra menu
-    if greeting_match(tl) or t:
-        first = KNOWN_NAMES.get(phone)
-        menu = welcome_text(first)
-
-        # atalhos diretos
-        if tl.startswith("1") or "produtos" in tl or "rezymol" in tl:
-            return produtos_menu_text()
-        if tl.startswith("2") or "compra" in tl:
-            return start_flow(phone, "compra")
-        if tl.startswith("3") or "catálogo" in tl or "catalogo" in tl:
-            return start_flow(phone, "catalogo")
-        if tl.startswith("4") or "atendente" in tl or "humano" in tl or "ajuda" in tl:
-            return start_flow(phone, "atendimento")
-
-        # caso apenas "oi" ou texto livre sem atalho: devolve o menu
-        return menu
-
-# ==============================
-# ENDPOINTS
-# ==============================
-@app.get("/api/webhook/receber")
-async def receber_get():
-    return {"ok": True, "hint": "Use POST para eventos. GET existe só para validação."}
+@app.get("/health")
+async def health():
+    return PlainTextResponse("ok")
 
 @app.post("/api/webhook/receber")
 async def receber(request: Request):
     body = await request.json()
-    print("RAW BODY:", body)
+    print("CORPO BRUTO :", body)
 
-    data = body.get("data") or body
+    # Z-API formatos comuns
+    phone = str(body.get("phone") or "")
+    from_me = bool(body.get("fromMe"))
+    status = body.get("status", "")  # RECEBIDO/RECEIVED etc
+    texto = ""
+    if isinstance(body.get("texto"), dict):
+        texto = str(body["texto"].get("mensagem") or "")
+    else:
+        texto = str(body.get("message") or body.get("text") or "")
 
-    phone = (
-        str(data.get("phone") or data.get("from") or data.get("chatId") or "")
-        .replace("@c.us", "")
-        .replace("@s.whatsapp.net", "")
-        .strip()
-    )
+    sender_name = body.get("senderName") or body.get("chatName") or ""
+    first_name = first_name_from_sender(sender_name)
+    if first_name:
+        KNOWN_NAMES[phone] = first_name
 
-    # Guarda primeiro nome se vier do payload
-    sender_name = data.get("senderName") or data.get("chatName")
-    first = first_name_from_sender(sender_name)
-    if phone and first:
-        KNOWN_NAMES[phone] = first
+    # Ignorar mensagens que EU enviei (para não entrar em loop)
+    if from_me:
+        return JSONResponse({"ok": True, "ignored": "fromMe"})
 
-    # Extração robusta do texto
-    text = ""
-    for k in ("message", "body", "text", "content", "texto"):
-        v = data.get(k)
-        if isinstance(v, str) and v.strip():
-            text = v.strip()
-            break
-        if isinstance(v, dict):
-            for kk in ("mensagem", "text", "body", "message", "caption"):
-                vv = v.get(kk)
-                if isinstance(vv, str) and vv.strip():
-                    text = vv.strip()
-                    break
-            if text:
-                break
-    if not text:
-        md = data.get("messageData") or {}
-        if isinstance(md, dict):
-            tmd = md.get("textMessageData") or md.get("extendedTextMessageData") or {}
-            if isinstance(tmd, dict):
-                for kk in ("textMessage", "text", "caption", "body"):
-                    vv = tmd.get(kk)
-                    if isinstance(vv, str) and vv.strip():
-                        text = vv.strip()
-                        break
-    if not text:
-        msgs = data.get("messages")
-        if isinstance(msgs, list) and msgs:
-            m0 = msgs[0]
-            if isinstance(m0, dict):
-                for kk in ("text", "body", "message", "content", "caption"):
-                    vv = m0.get(kk)
-                    if isinstance(vv, str) and vv.strip():
-                        text = vv.strip()
-                        break
+    print(f"==> MSG DE: {phone} | TEXTO: {texto}")
 
-    print("==> MSG DE:", phone, "| TEXTO:", text)
+    # Função para responder
+    async def reply(msg: str):
+        return await send_text_via_zapi(phone, msg)
 
-    if not phone or not text:
-        return JSONResponse({"ok": True, "ignored": True})
+    # Saída principal (tratamento de comandos)
+    ensure_session(phone)
+    msg_lower = (texto or "").strip().lower()
 
-    reply = route_message(phone, text)
+    # Saudações, símbolos curtos e chamada de menu
+    if (
+        msg_lower in GREET_TOKENS
+        or msg_lower in {"1", "2", "3", "4"}
+        or len(msg_lower) <= 2 and msg_lower in {"?", "ok", "oi", "hi", "yo", "👍", "👋"}
+        or msg_lower.startswith("spark")
+    ):
+        # Se for opção numérica, tratamos abaixo. Senão mostra menu
+        if msg_lower not in {"1", "2", "3", "4"} and msg_lower not in {"compra", "catalogo", "catálogo", "produtos", "atendente"}:
+            await reply(welcome_text(KNOWN_NAMES.get(phone)))
+            return JSONResponse({"ok": True})
 
-    # Se o reply contém marcador de catálogo, enviar o arquivo e depois a mensagem; também enviar e-mail
-    if isinstance(reply, str) and "__SEND_CATALOG_AFTER_LEAD__" in reply:
-        # envia catálogo no WhatsApp
-        if CATALOG_REZYMOL_URL:
-            status, resp = await send_file_via_zapi(
-                phone, CATALOG_REZYMOL_URL, "Catalogo-Rezymol.pdf", "📄 Catálogo Rezymol"
-            )
-            if status >= 300:
-                # fallback: envia o link como texto
-                await send_text_via_zapi(phone, f"📄 Catálogo Rezymol: {CATALOG_REZYMOL_URL}")
-        else:
-            await send_text_via_zapi(phone, "📄 Catálogo Rezymol não configurado no servidor.")
-
-        # tenta enviar por e-mail se disponível no último lead
-        lead = LAST_LEAD_BY_PHONE.get(phone, {})
-        email = (lead.get("email") or "").strip()
-        if email:
-            send_catalog_email(
-                to_email=email,
-                subject="Catálogo Rezymol – DSA Cristal Química",
-                body="Conforme solicitado, segue o catálogo Rezymol. Qualquer dúvida, estou à disposição.",
-                attachment_url=CATALOG_REZYMOL_URL if CATALOG_REZYMOL_URL else None,
-            )
-
-        clean_reply = reply.replace("__SEND_CATALOG_AFTER_LEAD__:rezymol", "").strip()
-        await send_text_via_zapi(phone, clean_reply)
+    # Comandos diretos
+    if msg_lower in {"menu", "início", "inicio", "help", "ajuda"}:
+        await reply(welcome_text(KNOWN_NAMES.get(phone)))
         return JSONResponse({"ok": True})
 
-    # resposta normal
-    await send_text_via_zapi(phone, reply)
+    if msg_lower in {"1", "produtos", "produto", "linha", "rezymol"}:
+        await reply(produtos_menu_text())
+        return JSONResponse({"ok": True})
+
+    if msg_lower in {"2", "compra", "comprar"}:
+        out = start_flow(phone, "compra")
+        await reply(out)
+        return JSONResponse({"ok": True})
+
+    if msg_lower in {"3", "catalogo", "catálogo", "catalogue"}:
+        out = start_flow(phone, "catalogo")
+        await reply(out)
+        return JSONResponse({"ok": True})
+
+    if msg_lower in {"4", "atendente", "especialista", "humano", "suporte"}:
+        out = start_flow(phone, "atendimento")
+        await reply(out)
+        return JSONResponse({"ok": True})
+
+    # Se já estiver em fluxo, continuar
+    sess = SESSIONS.get(phone) or {}
+    if sess.get("stage") not in (None, "done"):
+        resposta = continue_flow(phone, texto)
+
+        # Enviar texto da resposta (sem a flag)
+        clean_resp = resposta.replace("__SEND_CATALOG_AFTER_LEAD__:rezymol", "").strip()
+        if clean_resp:
+            await reply(clean_resp)
+
+        # Se houver a flag de envio do catálogo, dispara o arquivo via WhatsApp
+        if "__SEND_CATALOG_AFTER_LEAD__:rezymol" in resposta and CATALOG_REZYMOL_URL:
+            caption = "📘 *Catálogo Rezymol* — DSA Cristal Química\nSe preferir, salve este arquivo para consultar quando quiser."
+            status_code, resp_text = await send_file_via_zapi(
+                phone, CATALOG_REZYMOL_URL, file_name="Catalogo-Rezymol.pdf", caption=caption
+            )
+            if status_code >= 300:
+                # se falhar o envio do arquivo, avisa o usuário
+                await reply("Tive um problema ao enviar o catálogo. Pode me confirmar se recebeu? Se não, tento reenviar.")
+
+        return JSONResponse({"ok": True})
+
+    # Fora de fluxo, sem comando reconhecido → ajuda
+    await reply("Não entendi. Digite *menu* para ver as opções ou me diga o que precisa. 😊")
     return JSONResponse({"ok": True})
-
-# ==============================
-# HEALTHCHECK
-# ==============================
-@app.get("/health")
-async def health():
-    """
-    Endpoint de verificação usado pelo Render para monitorar a aplicação.
-    Retorna status 200 e JSON {"status": "ok"} quando o servidor está ativo.
-    """
-    return {"status": "ok"}
-
-# ==============================
-# RODAR LOCALMENTE
-# ==============================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
