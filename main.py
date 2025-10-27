@@ -83,33 +83,33 @@ def welcome_text(first_name: str | None = None) -> str:
 # ==============================
 # ENVIO VIA Z-API
 # ==============================
-async def send_file_via_zapi(phone: str, file_url: str, file_name: str = "", caption: str = ""):
+# ==============================
+# ENVIO DE TEXTO VIA Z-API
+# ==============================
+async def send_text_via_zapi(phone: str, message: str):
     """
-    Envia arquivo tentando múltiplos endpoints da Z-API.
-    Só considera sucesso quando NÃO houver 'error' no JSON de resposta.
-    Se todas as rotas falharem, retorna último status/texto para tratativa externa.
+    Envia mensagem de texto tentando múltiplos endpoints e formatos de payload da Z-API.
+    Só trata como sucesso quando NÃO houver 'error' no JSON de resposta.
+    Retorna (status_code, response_text).
     """
     headers = {"Client-Token": os.getenv("CLIENT_TOKEN") or os.getenv("ZAPI_CLIENT_TOKEN", "")}
     base = f"{ZAPI_BASE}/instances/{INSTANCE_ID}/token/{TOKEN}"
 
-    # Prepara nome padrão se não vier
-    safe_name = file_name or "Catalogo-Rezymol.pdf"
-    safe_caption = caption or "📄 Catálogo Rezymol"
-
-    # Alguns planos esperam 'file', outros aceitam 'url'. Tentaremos ambos.
+    # Variações de payload que já vi em diferentes planos/versões:
     candidate_payloads = [
-        {"phone": phone, "file": file_url, "fileName": safe_name, "caption": safe_caption},
-        {"phone": phone, "url": file_url,  "fileName": safe_name, "caption": safe_caption},
+        {"phone": phone, "message": message},
+        {"phone": phone, "text": message},
+        {"to": phone, "message": message},
+        {"to": phone, "text": message},
     ]
 
-    # Rotas conhecidas em diferentes versões/planos
+    # Variações de endpoint que a Z-API usa em planos diferentes:
     endpoints = [
-        "send-file",
-        "send-file-from-url",
-        "send-document",
-        "send-document-from-url",
-        "send-link-file",              # algumas contas usam esta
-        "send-file-url",               # variação rara, mas já vista
+        "send-text",
+        "send-message",
+        "send-text-message",
+        "send-message-text",
+        "send-text-to-number",
     ]
 
     async with httpx.AsyncClient(timeout=40) as client:
@@ -122,14 +122,11 @@ async def send_file_via_zapi(phone: str, file_url: str, file_name: str = "", cap
                     body_text = r.text
                     print(f"<== Z-API TRY {ep} STATUS: {r.status_code} | RESP: {body_text}")
 
-                    # Tenta decodificar JSON para checar 'error'
                     ok = False
                     try:
                         j = r.json()
-                        # Sucesso quando NÃO existe 'error' ou o campo é falsy
                         ok = (r.status_code < 300) and (not j.get("error"))
                     except Exception:
-                        # Se não for JSON, consideramos sucesso somente se for 2xx E corpo não conter 'error'
                         ok = (r.status_code < 300) and ("error" not in body_text.lower())
 
                     if ok:
@@ -141,8 +138,7 @@ async def send_file_via_zapi(phone: str, file_url: str, file_name: str = "", cap
                     print(f"<== Z-API TRY {ep} EXC: {repr(e)}")
                     last_status, last_text = 599, repr(e)
 
-        # Nenhum endpoint funcionou
-        return last_status or 500, last_text or "Falha ao enviar arquivo"
+        return last_status or 500, last_text or "Falha ao enviar texto"
 
 # ==============================
 # ENVIO POR E-MAIL (OPCIONAL)
