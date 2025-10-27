@@ -83,47 +83,65 @@ def welcome_text(first_name: str | None = None) -> str:
 # ==============================
 # ENVIO VIA Z-API
 # ==============================
-async def send_text_via_zapi(phone: str, message: str):
-    url = f"{ZAPI_BASE}/instances/{INSTANCE_ID}/token/{TOKEN}/send-text"
-    headers = {"Client-Token": CLIENT_TOKEN} if CLIENT_TOKEN else {}
-    payload = {"phone": phone, "message": message}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(url, json=payload, headers=headers)
-    print(f"<== Z-API SEND-TEXT STATUS: {r.status_code} | RESP: {r.text}")
-    return r.status_code, r.text
-
 async def send_file_via_zapi(phone: str, file_url: str, file_name: str = "", caption: str = ""):
     """
-    Tenta enviar arquivo por diferentes endpoints da Z-API, pois variam por plano/versão:
-      1) /send-file
-      2) /send-file-from-url
-      3) /send-document
-    Usa o primeiro que funcionar (status < 300). Loga a resposta de cada tentativa.
+    Envia arquivo tentando múltiplos endpoints da Z-API.
+    Só considera sucesso quando NÃO houver 'error' no JSON de resposta.
+    Se todas as rotas falharem, retorna último status/texto para tratativa externa.
     """
-    headers = {"Client-Token": CLIENT_TOKEN} if CLIENT_TOKEN else {}
+    headers = {"Client-Token": os.getenv("CLIENT_TOKEN") or os.getenv("ZAPI_CLIENT_TOKEN", "")}
     base = f"{ZAPI_BASE}/instances/{INSTANCE_ID}/token/{TOKEN}"
 
-    payload = {"phone": phone, "file": file_url}
-    if file_name:
-        payload["fileName"] = file_name
-    if caption:
-        payload["caption"] = caption
+    # Prepara nome padrão se não vier
+    safe_name = file_name or "Catalogo-Rezymol.pdf"
+    safe_caption = caption or "📄 Catálogo Rezymol"
 
-    endpoints = ["send-file", "send-file-from-url", "send-document"]
+    # Alguns planos esperam 'file', outros aceitam 'url'. Tentaremos ambos.
+    candidate_payloads = [
+        {"phone": phone, "file": file_url, "fileName": safe_name, "caption": safe_caption},
+        {"phone": phone, "url": file_url,  "fileName": safe_name, "caption": safe_caption},
+    ]
+
+    # Rotas conhecidas em diferentes versões/planos
+    endpoints = [
+        "send-file",
+        "send-file-from-url",
+        "send-document",
+        "send-document-from-url",
+        "send-link-file",              # algumas contas usam esta
+        "send-file-url",               # variação rara, mas já vista
+    ]
 
     async with httpx.AsyncClient(timeout=40) as client:
         last_status, last_text = None, None
         for ep in endpoints:
             url = f"{base}/{ep}"
-            try:
-                r = await client.post(url, json=payload, headers=headers)
-                print(f"<== Z-API TRY {ep} STATUS: {r.status_code} | RESP: {r.text}")
-                if r.status_code < 300:
-                    return r.status_code, r.text
-                last_status, last_text = r.status_code, r.text
-            except Exception as e:
-                print(f"<== Z-API TRY {ep} EXC: {repr(e)}")
-                last_status, last_text = 599, repr(e)
+            for payload in candidate_payloads:
+                try:
+                    r = await client.post(url, json=payload, headers=headers)
+                    body_text = r.text
+                    print(f"<== Z-API TRY {ep} STATUS: {r.status_code} | RESP: {body_text}")
+
+                    # Tenta decodificar JSON para checar 'error'
+                    ok = False
+                    try:
+                        j = r.json()
+                        # Sucesso quando NÃO existe 'error' ou o campo é falsy
+                        ok = (r.status_code < 300) and (not j.get("error"))
+                    except Exception:
+                        # Se não for JSON, consideramos sucesso somente se for 2xx E corpo não conter 'error'
+                        ok = (r.status_code < 300) and ("error" not in body_text.lower())
+
+                    if ok:
+                        return r.status_code, body_text
+
+                    last_status, last_text = r.status_code, body_text
+
+                except Exception as e:
+                    print(f"<== Z-API TRY {ep} EXC: {repr(e)}")
+                    last_status, last_text = 599, repr(e)
+
+        # Nenhum endpoint funcionou
         return last_status or 500, last_text or "Falha ao enviar arquivo"
 
 # ==============================
