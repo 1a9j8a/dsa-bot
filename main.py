@@ -2,6 +2,7 @@ import os
 import csv
 import re
 import time
+import asyncio
 from datetime import datetime
 from pathlib import Path
 
@@ -31,12 +32,19 @@ app = FastAPI(title="DSA Bot - Spark")
 SESSIONS: dict[str, dict] = {}           # estado por telefone
 LEADS_CSV = Path("leads.csv")
 KNOWN_NAMES: dict[str, str] = {}         # primeiro nome por telefone
-IDLE_NUDGE_SECONDS = 600                 # 10min
 
-# Palavras-chave que disparam saudação/menu
+# tempos (segundos)
+IDLE_10_MIN = 10 * 60
+FOLLOWUP_1H = 60 * 60
+FOLLOWUP_24H = 24 * 60 * 60
+
+# Palavras-chave que disparam saudação/menu (reinício)
 GREET_TOKENS = {
-    "oi", "olá", "ola", "oie", "hey", "hi", "hello", "bom dia", "boa tarde", "boa noite",
-    "menu", "início", "inicio", "começar", "comecar", "start", "help", "ajuda"
+    "oi", "olá", "ola", "oie", "hey", "hi", "hello",
+    "bom dia", "boa tarde", "boa noite",
+    "menu", "início", "inicio", "começar", "comecar", "start", "help", "ajuda",
+    "quero mais informações", "quero saber da promoção", "quero saber da promocao",
+    "promoção", "promocao", "informações", "informacao", "informacoes", "info"
 }
 
 # ==============================
@@ -81,9 +89,6 @@ def zapi_base_url() -> str:
     return f"{ZAPI_BASE}/instances/{INSTANCE_ID}/token/{TOKEN}"
 
 async def send_text_via_zapi(phone: str, message: str):
-    """
-    Envia mensagem de texto via Z-API.
-    """
     url = f"{zapi_base_url()}/send-text"
     headers = {"Client-Token": CLIENT_TOKEN} if CLIENT_TOKEN else {}
     payload = {"phone": phone, "message": message}
@@ -93,27 +98,15 @@ async def send_text_via_zapi(phone: str, message: str):
         return r.status_code, r.text
 
 async def send_file_via_zapi(phone: str, file_url: str, file_name: str = "", caption: str = ""):
-    """
-    Tenta enviar arquivo por diferentes endpoints da Z-API, pois variam por plano/versão:
-      1) /send-file
-      2) /send-file-from-url
-      3) /send-document
-    Usa o primeiro que funcionar (status < 300). Loga a resposta de cada tentativa.
-    """
     headers = {"Client-Token": CLIENT_TOKEN} if CLIENT_TOKEN else {}
     base = zapi_base_url()
-
     payload = {"phone": phone, "file": file_url}
     if file_name:
         payload["fileName"] = file_name
     if caption:
         payload["caption"] = caption
 
-    endpoints = [
-        "send-file",
-        "send-file-from-url",
-        "send-document",
-    ]
+    endpoints = ["send-file", "send-file-from-url", "send-document"]
 
     async with httpx.AsyncClient(timeout=40) as client:
         last_status, last_text = None, None
@@ -128,25 +121,38 @@ async def send_file_via_zapi(phone: str, file_url: str, file_name: str = "", cap
             except Exception as e:
                 print(f"<== Z-API TRY {ep} EXC: {repr(e)}")
                 last_status, last_text = 599, repr(e)
-        # se chegou aqui, nenhuma rota funcionou
         return last_status or 500, last_text or "Falha ao enviar arquivo"
 
 # ==============================
-# AUXILIARES
+# AUXILIARES DE SESSÃO
 # ==============================
-def ensure_session(phone: str):
-    SESSIONS.setdefault(phone, {"stage": None, "mode": None, "data": {}, "last": time.time()})
-    SESSIONS[phone]["last"] = time.time()
+def reset_session(phone: str):
+    SESSIONS[phone] = {
+        "stage": None,
+        "mode": None,
+        "data": {},
+        "last_user": time.time(),
+        "last_bot": 0.0,
+        "followups": {
+            "idle10_sent": False,
+            "hour_sent": False,
+            "day_sent": False
+        },
+        "proposal_time": 0.0,     # quando o pedido é finalizado
+        "flow_complete": False     # fluxo finalizado
+    }
 
-def maybe_idle_nudge(phone: str) -> str | None:
-    sess = SESSIONS.get(phone)
-    if not sess:
-        return None
-    last = sess.get("last", time.time())
-    if time.time() - last > IDLE_NUDGE_SECONDS and sess.get("stage") not in (None, "done"):
-        SESSIONS[phone]["last"] = time.time()
-        return "Entendi! Pode me contar qual é a sua dúvida? Estou aqui pra te ajudar 👍"
-    return None
+def ensure_session(phone: str):
+    if phone not in SESSIONS:
+        reset_session(phone)
+
+def mark_user_activity(phone: str):
+    ensure_session(phone)
+    SESSIONS[phone]["last_user"] = time.time()
+
+def mark_bot_activity(phone: str):
+    ensure_session(phone)
+    SESSIONS[phone]["last_bot"] = time.time()
 
 def first_name_from_sender(sender: str | None) -> str | None:
     if not sender:
@@ -198,13 +204,6 @@ CATALOG_KEYWORDS = [
 ]
 
 def parse_items_free_text(line: str) -> list[dict]:
-    """
-    Tenta pegar padrões como:
-      - "Fluido Antiaderente x2"
-      - "Removedor de Resinas x 3"
-      - múltiplos separados por vírgula/ponto e vírgula
-    Retorna: [{"desc": <produto>, "qty": <int>}]
-    """
     out = []
     parts = re.split(r"[;,]\s*", line)
     for part in parts:
@@ -220,15 +219,81 @@ def parse_items_free_text(line: str) -> list[dict]:
     return out
 
 # ==============================
+# FOLLOW-UPS PROATIVOS (tarefas agendadas em memória)
+# ==============================
+async def schedule_idle_10min_followup(phone: str):
+    # Espera 10 min; se ninguém falou desde então, envia lembrete (uma única vez)
+    start = SESSIONS[phone]["last_user"]
+    await asyncio.sleep(IDLE_10_MIN)
+    sess = SESSIONS.get(phone)
+    if not sess:
+        return
+    if sess["followups"]["idle10_sent"]:
+        return
+    # Se houve atividade depois do agendamento, não envia
+    if sess["last_user"] > start or sess["flow_complete"]:
+        return
+    sess["followups"]["idle10_sent"] = True
+    msg = "Só confirmando: ficou alguma dúvida? Posso te ajudar e seguimos de onde paramos. 🙂"
+    await send_text_via_zapi(phone, msg)
+    mark_bot_activity(phone)
+
+async def schedule_proposal_1h_followup(phone: str):
+    # 1h após proposta/pedido finalizado
+    base_time = SESSIONS[phone]["proposal_time"]
+    await asyncio.sleep(FOLLOWUP_1H)
+    sess = SESSIONS.get(phone)
+    if not sess:
+        return
+    if sess["followups"]["hour_sent"]:
+        return
+    # Se o usuário respondeu depois da proposta, não insiste
+    if sess["last_user"] > base_time:
+        return
+    sess["followups"]["hour_sent"] = True
+    msg = "Sobre a proposta que enviamos há pouco: surgiu alguma dúvida? Estou por aqui para ajudar! 💬"
+    await send_text_via_zapi(phone, msg)
+    mark_bot_activity(phone)
+
+async def schedule_day_24h_followup(phone: str):
+    base_time = max(SESSIONS[phone]["last_user"], SESSIONS[phone]["last_bot"])
+    await asyncio.sleep(FOLLOWUP_24H)
+    sess = SESSIONS.get(phone)
+    if not sess:
+        return
+    if sess["followups"]["day_sent"]:
+        return
+    if max(sess["last_user"], sess["last_bot"]) > base_time:
+        return
+    sess["followups"]["day_sent"] = True
+    msg = "Passando para dizer que seguimos à disposição para te atender quando quiser. 🤝"
+    await send_text_via_zapi(phone, msg)
+    mark_bot_activity(phone)
+
+def start_idle_10min_timer(phone: str):
+    # dispara checagem de 10min sempre que o usuário manda algo no meio do fluxo
+    ensure_session(phone)
+    SESSIONS[phone]["followups"]["idle10_sent"] = False
+    asyncio.create_task(schedule_idle_10min_followup(phone))
+
+def start_day_24h_timer(phone: str):
+    ensure_session(phone)
+    # não reseta o flag se já enviado; apenas agenda a partir do momento atual
+    asyncio.create_task(schedule_day_24h_followup(phone))
+
+# ==============================
 # FLUXOS
 # ==============================
 def start_flow(phone: str, mode: str):
     ensure_session(phone)
-    # NÃO reinicia se já está em fluxo
-    if SESSIONS[phone].get("stage") not in (None, "done"):
-        return "Você já está em um fluxo. Pode continuar de onde parou. 😊"
-
-    SESSIONS[phone] = {"mode": mode, "stage": "ask_name", "data": {"cart": []}, "last": time.time()}
+    # reinicia fluxo do zero
+    SESSIONS[phone].update({
+        "mode": mode,
+        "stage": "ask_name",
+        "data": {"cart": []},
+        "flow_complete": False
+    })
+    start_idle_10min_timer(phone)   # começa a vigiar 10min durante o fluxo
     if mode == "compra":
         return "🛒 Vamos registrar seu pedido! Qual é o seu *nome*?"
     if mode == "catalogo":
@@ -240,22 +305,18 @@ def continue_flow(phone: str, text: str) -> str:
     sess = SESSIONS[phone]
     data = sess["data"]
     mode = sess["mode"]
-    tl = text.lower().strip()
-
-    # lembrete de inatividade
-    nudge = maybe_idle_nudge(phone)
-    prefix = f"{nudge}\n\n" if nudge else ""
+    tl = (text or "").strip().lower()
 
     # COMUM
     if sess["stage"] == "ask_name":
         data["nome"] = text.strip()
         sess["stage"] = "ask_phone"
-        return prefix + "Por favor, informe seu *telefone* com DDD."
+        return "Por favor, informe seu *telefone* com DDD."
 
     if sess["stage"] == "ask_phone":
         data["telefone_cliente"] = re.sub(r"\D", "", text)
         sess["stage"] = "ask_profile"
-        return prefix + (
+        return (
             "Qual é o seu *perfil*?\n"
             "1) Representante\n"
             "2) Cliente\n"
@@ -272,12 +333,12 @@ def continue_flow(phone: str, text: str) -> str:
         }
         data["perfil"] = perfis.get(tl, text.strip())
         sess["stage"] = "ask_company"
-        return prefix + "Qual é o nome da *empresa*?"
+        return "Qual é o nome da *empresa*?"
 
     if sess["stage"] == "ask_company":
         data["empresa"] = text.strip()
         sess["stage"] = "ask_cnpj"
-        return prefix + "Perfeito. Qual é o *CNPJ* da empresa? (somente números)"
+        return "Perfeito. Qual é o *CNPJ* da empresa? (somente números)"
 
     if sess["stage"] == "ask_cnpj":
         m = re.search(r"\b\d{14}\b", text)
@@ -288,16 +349,15 @@ def continue_flow(phone: str, text: str) -> str:
             if data.get("perfil", "").lower().startswith("represent")
             else "Informe o *endereço* (Rua, número, bairro, cidade, UF, CEP)."
         )
-        return prefix + label
+        return label
 
     if sess["stage"] == "ask_endereco":
         data["endereco"] = text.strip()
         if mode == "catalogo":
             sess["stage"] = "ask_email_catalogo"
-            return prefix + "Por fim, seu *e-mail* para registro (opcional)."
-        # compra e atendimento seguem para e-mail
+            return "Por fim, seu *e-mail* para registro (opcional)."
         sess["stage"] = "ask_email"
-        return prefix + "Por fim, seu *e-mail* de contato (opcional)."
+        return "Por fim, seu *e-mail* de contato (opcional)."
 
     # ==============================
     # CATÁLOGO (envio SÓ via WhatsApp)
@@ -306,6 +366,7 @@ def continue_flow(phone: str, text: str) -> str:
         if sess["stage"] == "ask_email_catalogo":
             data["email"] = text.strip()  # apenas registro/CSV
             sess["stage"] = "done"
+            sess["flow_complete"] = True
             save_lead(data, phone, "catalogo")
 
             resumo = (
@@ -315,6 +376,8 @@ def continue_flow(phone: str, text: str) -> str:
                 f"🆔 *CNPJ:* {data.get('cnpj','')}\n"
                 "Se precisar de ajuda com algum produto ou cotação, é só me avisar! 💬"
             )
+            # Agenda lembrete de 24h a partir de agora
+            start_day_24h_timer(phone)
             # Flag para o webhook enviar o arquivo via WhatsApp com send_file_via_zapi
             return f"{resumo}\n__SEND_CATALOG_AFTER_LEAD__:rezymol"
 
@@ -325,7 +388,7 @@ def continue_flow(phone: str, text: str) -> str:
         if sess["stage"] == "ask_email":
             data["email"] = text.strip()
             sess["stage"] = "ask_items"
-            return prefix + (
+            return (
                 "Perfeito! Agora me diga *produtos e quantidades*.\n\n"
                 "Exemplos:\n"
                 "• Fluido Antiaderente x2\n"
@@ -335,9 +398,9 @@ def continue_flow(phone: str, text: str) -> str:
 
         if sess["stage"] == "ask_items":
             if tl == "finalizar":
-                # finalizar pedido
                 order_code = generate_order_code(phone)
                 sess["stage"] = "done"
+                sess["flow_complete"] = True
                 save_lead(data, phone, "compra")
 
                 itens_str = (
@@ -358,6 +421,12 @@ def continue_flow(phone: str, text: str) -> str:
                     "✅ Obrigado por confiar na *DSA Cristal Química*!\n"
                     "Em instantes, um atendente entrará em contato para confirmar os detalhes do seu pedido. 🙌"
                 )
+                # registra tempo da “proposta/pedido” para follow-up de 1h
+                SESSIONS[phone]["proposal_time"] = time.time()
+                SESSIONS[phone]["followups"]["hour_sent"] = False
+                asyncio.create_task(schedule_proposal_1h_followup(phone))
+                # agenda lembrete de 24h
+                start_day_24h_timer(phone)
                 return resumo
 
             # tentar adicionar itens da linha
@@ -366,11 +435,10 @@ def continue_flow(phone: str, text: str) -> str:
                 data.setdefault("cart", []).extend(parsed)
                 added = "\n".join([f"• {i['desc']} x{i['qty']}" for i in parsed])
                 return (
-                    prefix
-                    + f"Adicionei ao carrinho:\n{added}\n\nSe quiser, envie mais itens. Para encerrar, digite *finalizar*."
+                    f"Adicionei ao carrinho:\n{added}\n\nSe quiser, envie mais itens. Para encerrar, digite *finalizar*."
                 )
             else:
-                return prefix + (
+                return (
                     "Não consegui identificar itens nessa mensagem.\n"
                     "Envie no formato: *Produto x2* (separando por vírgulas ou ponto e vírgula)."
                 )
@@ -382,14 +450,17 @@ def continue_flow(phone: str, text: str) -> str:
         if sess["stage"] == "ask_email":
             data["email"] = text.strip()
             sess["stage"] = "done"
+            sess["flow_complete"] = True
             save_lead(data, phone, "atendimento")
-            return prefix + (
+            # agenda lembrete de 24h
+            start_day_24h_timer(phone)
+            return (
                 "✅ Dados recebidos! Em instantes um atendente da DSA falará com você.\n"
                 f"Resumo: *{data.get('nome','')}*, *{data.get('empresa','')}*, *{data.get('endereco','')}*."
             )
 
     # fallback
-    return prefix + "Pode repetir, por favor? Digite *menu* para ver as opções."
+    return "Pode repetir, por favor? Digite *menu* para ver as opções."
 
 # ==============================
 # ROUTES
@@ -410,7 +481,8 @@ async def receber(request: Request):
     # Z-API formatos comuns
     phone = str(body.get("phone") or "")
     from_me = bool(body.get("fromMe"))
-    status = body.get("status", "")  # RECEBIDO/RECEIVED etc
+    status = body.get("status", "")
+    # normaliza texto
     texto = ""
     if isinstance(body.get("texto"), dict):
         texto = str(body["texto"].get("mensagem") or "")
@@ -427,34 +499,35 @@ async def receber(request: Request):
         return JSONResponse({"ok": True, "ignored": "fromMe"})
 
     print(f"==> MSG DE: {phone} | TEXTO: {texto}")
+    mark_user_activity(phone)
 
-    # Função para responder
+    # função para responder
     async def reply(msg: str):
-        return await send_text_via_zapi(phone, msg)
+        status, _ = await send_text_via_zapi(phone, msg)
+        mark_bot_activity(phone)
+        return status
 
-    # Saída principal (tratamento de comandos)
-    ensure_session(phone)
+    # Saudações/atalhos SEMPRE reiniciam (sua opção A)
     msg_lower = (texto or "").strip().lower()
+    def is_greeting_token(s: str) -> bool:
+        s = re.sub(r"[!,.?;:]+", "", s).strip()
+        return s in GREET_TOKENS
 
-    # Saudações, símbolos curtos e chamada de menu
-    if (
-        msg_lower in GREET_TOKENS
-        or msg_lower in {"1", "2", "3", "4"}
-        or len(msg_lower) <= 2 and msg_lower in {"?", "ok", "oi", "hi", "yo", "👍", "👋"}
-        or msg_lower.startswith("spark")
-    ):
-        # Se for opção numérica, tratamos abaixo. Senão mostra menu
-        if msg_lower not in {"1", "2", "3", "4"} and msg_lower not in {"compra", "catalogo", "catálogo", "produtos", "atendente"}:
-            await reply(welcome_text(KNOWN_NAMES.get(phone)))
-            return JSONResponse({"ok": True})
+    if is_greeting_token(msg_lower):
+        reset_session(phone)
+        await reply(welcome_text(KNOWN_NAMES.get(phone)))
+        return JSONResponse({"ok": True, "reset": True})
 
-    # Comandos diretos
+    # Comandos diretos equivalentes
     if msg_lower in {"menu", "início", "inicio", "help", "ajuda"}:
+        reset_session(phone)
         await reply(welcome_text(KNOWN_NAMES.get(phone)))
         return JSONResponse({"ok": True})
 
     if msg_lower in {"1", "produtos", "produto", "linha", "rezymol"}:
+        ensure_session(phone)
         await reply(produtos_menu_text())
+        start_day_24h_timer(phone)  # mesmo fora de fluxo, agenda 24h
         return JSONResponse({"ok": True})
 
     if msg_lower in {"2", "compra", "comprar"}:
@@ -473,11 +546,14 @@ async def receber(request: Request):
         return JSONResponse({"ok": True})
 
     # Se já estiver em fluxo, continuar
-    sess = SESSIONS.get(phone) or {}
-    if sess.get("stage") not in (None, "done"):
+    sess = SESSIONS.get(phone)
+    if sess and sess.get("stage") not in (None, "done"):
+        # a cada mensagem do usuário no fluxo, (re)agenda o lembrete de 10min
+        start_idle_10min_timer(phone)
+
         resposta = continue_flow(phone, texto)
 
-        # Enviar texto da resposta (sem a flag)
+        # Envia texto da resposta (sem a flag)
         clean_resp = resposta.replace("__SEND_CATALOG_AFTER_LEAD__:rezymol", "").strip()
         if clean_resp:
             await reply(clean_resp)
@@ -489,11 +565,10 @@ async def receber(request: Request):
                 phone, CATALOG_REZYMOL_URL, file_name="Catalogo-Rezymol.pdf", caption=caption
             )
             if status_code >= 300:
-                # se falhar o envio do arquivo, avisa o usuário
                 await reply("Tive um problema ao enviar o catálogo. Pode me confirmar se recebeu? Se não, tento reenviar.")
-
         return JSONResponse({"ok": True})
 
-    # Fora de fluxo, sem comando reconhecido → ajuda
+    # Fora de fluxo, sem comando reconhecido → ajuda + agenda 24h
     await reply("Não entendi. Digite *menu* para ver as opções ou me diga o que precisa. 😊")
+    start_day_24h_timer(phone)
     return JSONResponse({"ok": True})
