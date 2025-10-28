@@ -206,37 +206,60 @@ def generate_order_code(phone: str) -> str:
 # -------- NOVO: extração robusta do texto recebido --------
 def extract_incoming_text(body: dict) -> str:
     """
-    Extrai o texto da mensagem de forma robusta:
-    - Se 'texto' for dict: usa 'mensagem'
-    - Se 'texto' for string parecida com JSON/dict: tenta regex para campo 'mensagem'
-    - Fallbacks: 'message', 'text', 'body', 'content', 'msg'
+    Extrai o texto da mensagem de forma robusta, cobrindo variações da Z-API:
+    - 'texto': {'mensagem': '...'}  (PT)
+    - 'text':  {'message':  '...'}  (EN)
+    - 'texto' ou 'text' como string parecida com dict
+    - fallbacks: 'message', 'text', 'body', 'content', 'msg'
     """
+    def pick_from_dict(d: dict) -> str | None:
+        # chaves mais comuns
+        for k in ("mensagem", "message", "text"):
+            v = d.get(k)
+            if isinstance(v, (str, int, float)):
+                return str(v).strip()
+        # primeiro valor simples disponível
+        for v in d.values():
+            if isinstance(v, (str, int, float)):
+                return str(v).strip()
+        return None
+
+    # 1) 'texto'
     raw = body.get("texto")
-
-    # Caso 1: já é dict com campo 'mensagem'
     if isinstance(raw, dict):
-        v = raw.get("mensagem")
-        if isinstance(v, (str, int, float)):
-            return str(v).strip()
-
-    # Caso 2: veio como string "{'mensagem': 'oi'}" ou '{"mensagem":"oi"}'
-    if isinstance(raw, str):
-        # tenta com aspas simples
-        m = re.search(r"'mensagem'\s*:\s*'([^']*)'", raw)
+        v = pick_from_dict(raw)
+        if v is not None:
+            return v
+    elif isinstance(raw, str):
+        # {'mensagem': '...'} ou {"message":"..."}
+        m = re.search(r"'mensagem'\s*:\s*'([^']*)'", raw) or re.search(r'"mensagem"\s*:\s*"([^"]*)"', raw)
+        if not m:
+            m = re.search(r"'message'\s*:\s*'([^']*)'", raw) or re.search(r'"message"\s*:\s*"([^"]*)"', raw)
         if m:
             return m.group(1).strip()
-        # tenta com aspas duplas
-        m = re.search(r'"mensagem"\s*:\s*"([^"]*)"', raw)
-        if m:
-            return m.group(1).strip()
-        # caso seja apenas o texto puro
         if raw.strip():
             return raw.strip()
 
-    # Fallbacks comuns
+    # 2) 'text'
+    raw2 = body.get("text")
+    if isinstance(raw2, dict):
+        v = pick_from_dict(raw2)
+        if v is not None:
+            return v
+    elif isinstance(raw2, str):
+        m = re.search(r"'mensagem'\s*:\s*'([^']*)'", raw2) or re.search(r'"mensagem"\s*:\s*"([^"]*)"', raw2)
+        if not m:
+            m = re.search(r"'message'\s*:\s*'([^']*)'", raw2) or re.search(r'"message"\s*:\s*"([^"]*)"', raw2)
+        if m:
+            return m.group(1).strip()
+        if raw2.strip():
+            return raw2.strip()
+
+    # 3) Fallbacks simples
     for key in ("message", "text", "body", "content", "msg"):
-        if body.get(key):
-            return str(body.get(key)).strip()
+        v = body.get(key)
+        if isinstance(v, (str, int, float)):
+            return str(v).strip()
 
     return ""
 
