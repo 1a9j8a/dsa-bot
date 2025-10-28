@@ -203,6 +203,43 @@ def generate_order_code(phone: str) -> str:
     short_phone = phone[-4:] if phone else "0000"
     return f"PED-{short_phone}-{date_str}-{str(len(SESSIONS) + 1).zfill(3)}"
 
+# -------- NOVO: extração robusta do texto recebido --------
+def extract_incoming_text(body: dict) -> str:
+    """
+    Extrai o texto da mensagem de forma robusta:
+    - Se 'texto' for dict: usa 'mensagem'
+    - Se 'texto' for string parecida com JSON/dict: tenta regex para campo 'mensagem'
+    - Fallbacks: 'message', 'text', 'body', 'content', 'msg'
+    """
+    raw = body.get("texto")
+
+    # Caso 1: já é dict com campo 'mensagem'
+    if isinstance(raw, dict):
+        v = raw.get("mensagem")
+        if isinstance(v, (str, int, float)):
+            return str(v).strip()
+
+    # Caso 2: veio como string "{'mensagem': 'oi'}" ou '{"mensagem":"oi"}'
+    if isinstance(raw, str):
+        # tenta com aspas simples
+        m = re.search(r"'mensagem'\s*:\s*'([^']*)'", raw)
+        if m:
+            return m.group(1).strip()
+        # tenta com aspas duplas
+        m = re.search(r'"mensagem"\s*:\s*"([^"]*)"', raw)
+        if m:
+            return m.group(1).strip()
+        # caso seja apenas o texto puro
+        if raw.strip():
+            return raw.strip()
+
+    # Fallbacks comuns
+    for key in ("message", "text", "body", "content", "msg"):
+        if body.get(key):
+            return str(body.get(key)).strip()
+
+    return ""
+
 # ==============================
 # PARSE DE ITENS (livre: “produto x2” etc.)
 # ==============================
@@ -441,12 +478,8 @@ async def receber(request: Request):
     from_me = bool(body.get("fromMe"))
     status = body.get("status", "")
 
-    # Extrair corretamente o texto da mensagem (fix)
-    raw_text_block = body.get("texto")
-    if isinstance(raw_text_block, dict):
-        texto = str(raw_text_block.get("mensagem") or "").strip()
-    else:
-        texto = str(raw_text_block or body.get("message") or body.get("text") or "").strip()
+    # === NOVO: usa extração robusta ===
+    texto = extract_incoming_text(body)
 
     sender_name = body.get("senderName") or body.get("chatName") or ""
     first_name = first_name_from_sender(sender_name)
@@ -457,7 +490,7 @@ async def receber(request: Request):
     if from_me:
         return JSONResponse({"ok": True, "ignored": "fromMe"})
 
-    print(f"==> MSG DE: {phone} | TEXTO: {texto}")
+    print(f"==> MSG DE: {phone} | TEXTO PARS: {texto!r}")
 
     # Função para responder
     async def reply(msg: str):
@@ -471,14 +504,15 @@ async def receber(request: Request):
     msg_lower = (texto or "").strip().lower()
 
     # 1) Saudação / intenção de informação / promoção / menu rápido
-    # Dispara menu se a frase contém qualquer keyword definida
     contains_greet = any(k in msg_lower for k in GREET_KEYWORDS)
     is_quick_symbol = (len(msg_lower) <= 2 and msg_lower in {"?", "ok", "oi", "hi", "yo", "👍", "👋"})
     numeric_option = msg_lower in {"1", "2", "3", "4"}
     direct_token = msg_lower in COMMAND_TOKENS or msg_lower.startswith("spark")
 
     if contains_greet or is_quick_symbol or numeric_option or direct_token:
-        if msg_lower not in {"1", "2", "3", "4"} and msg_lower not in {"compra", "catalogo", "catálogo", "produtos", "atendente"}:
+        # Se digitou número, vamos cair na tratativa de comando logo abaixo,
+        # então só mandamos o menu automático quando NÃO for número/comando direto:
+        if not (numeric_option or msg_lower in {"compra", "catalogo", "catálogo", "produtos", "atendente"}):
             await reply(welcome_text(KNOWN_NAMES.get(phone)))
             return JSONResponse({"ok": True})
 
@@ -525,7 +559,6 @@ async def receber(request: Request):
                 phone, CATALOG_REZYMOL_URL, file_name="Catalogo-Rezymol.pdf", caption=caption
             )
             if status_code >= 300:
-                # se falhar o envio do arquivo, avisa o usuário
                 await reply("Tive um problema ao enviar o catálogo. Pode me confirmar se recebeu? Se não, tento reenviar.")
 
         return JSONResponse({"ok": True})
@@ -550,7 +583,6 @@ async def cron_tick():
     now = time.time()
     results = []
 
-    # Itera em cópia para evitar RuntimeError se algo mudar durante o loop
     for phone, sess in list(SESSIONS.items()):
         try:
             stage = sess.get("stage")
@@ -559,26 +591,22 @@ async def cron_tick():
             flags = sess.setdefault("nudge_flags", {"10m": False, "1h": False, "24h": False})
             last_out = float(sess.get("last_outbound", 0.0))
 
-            # só faz sentido cutucar se está em fluxo e não finalizado
             if stage in (None, "done"):
                 continue
 
             elapsed = now - last
 
-            # Evita flood: se acabamos de mandar algo, segura 60s
             if now - last_out < 60:
                 continue
 
-            # 10 minutos: dúvida geral (vale para qualquer fluxo em andamento)
             if elapsed >= NUDGE_10M and not flags.get("10m", False):
                 msg = "Percebi que ficou um tempinho sem responder. Posso ajudar em algo ou ficou alguma dúvida? 🙂"
                 await send_text_via_zapi(phone, msg)
                 sess["last_outbound"] = now
                 flags["10m"] = True
                 results.append((phone, "nudge_10m"))
-                continue  # evita mandar dois nudges no mesmo tick
+                continue
 
-            # 1 hora: se for fluxo de compra, reforçar proposta/itens
             if mode == "compra" and elapsed >= NUDGE_1H and not flags.get("1h", False):
                 msg = "Conseguiu verificar a proposta/itens? Se precisar, reviso os detalhes ou ajusto o pedido. 👌"
                 await send_text_via_zapi(phone, msg)
@@ -587,7 +615,6 @@ async def cron_tick():
                 results.append((phone, "nudge_1h"))
                 continue
 
-            # 24 horas: mensagem de disponibilidade
             if elapsed >= NUDGE_24H and not flags.get("24h", False):
                 msg = "Continuo à disposição para te ajudar quando quiser. É só me chamar por aqui. 🤝"
                 await send_text_via_zapi(phone, msg)
