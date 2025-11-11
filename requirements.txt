@@ -3,3 +3,8 @@ fastapi
 uvicorn
 httpx
 python-dotenv
+
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
