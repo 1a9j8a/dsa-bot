@@ -186,14 +186,14 @@ def save_lead(data: dict, phone: str, mode: str = "atendimento"):
         if not file_exists:
             writer.writeheader()
         writer.writerow({
-            "telefone": phone,
-            "nome": data.get("nome", ""),
-            "telefone_cliente": data.get("telefone_cliente", ""),
-            "perfil": data.get("perfil", ""),
-            "empresa": data.get("empresa", ""),
-            "cnpj": data.get("cnpj", ""),
-            "endereco": data.get("endereco", ""),
-            "email": data.get("email", ""),
+            "Telefone": phone,
+            "Nome": data.get("nome", ""),
+            "Telefone_cliente": data.get("telefone_cliente", ""),
+            "Perfil": data.get("perfil", ""),
+            "Empresa": data.get("empresa", ""),
+            "CNPJ": data.get("cnpj", ""),
+            "Endereco": data.get("endereco", ""),
+            "Email": data.get("email", ""),
             "modo": mode,
             "itens": "; ".join([f"{i['desc']} x{i['qty']}" for i in data.get("cart", [])]) if data.get("cart") else "",
         })
@@ -206,61 +206,55 @@ def generate_order_code(phone: str) -> str:
 # -------- NOVO: extração robusta do texto recebido --------
 def extract_incoming_text(body: dict) -> str:
     """
-    Extrai o texto da mensagem de forma robusta, cobrindo variações da Z-API:
-    - 'texto': {'mensagem': '...'}  (PT)
-    - 'text':  {'message':  '...'}  (EN)
-    - 'texto' ou 'text' como string parecida com dict
-    - fallbacks: 'message', 'text', 'body', 'content', 'msg'
+    Extrai o texto da mensagem de forma robusta, cobrindo variações PT/EN da Z-API
+    e eventos sem texto (áudio, imagem, template). Retorna "" quando não houver texto.
     """
-    def pick_from_dict(d: dict) -> str | None:
-        # chaves mais comuns
-        for k in ("mensagem", "message", "text"):
-            v = d.get(k)
-            if isinstance(v, (str, int, float)):
-                return str(v).strip()
-        # primeiro valor simples disponível
-        for v in d.values():
-            if isinstance(v, (str, int, float)):
-                return str(v).strip()
-        return None
+    # 1) Bloco 'texto' (pt) ou 'text' (en) como dict/str
+    for container_key, inner_keys in (("texto", ("mensagem", "message", "text")),
+                                      ("text",  ("message", "mensagem", "text"))):
+        raw = body.get(container_key)
+        if isinstance(raw, dict):
+            for k in inner_keys:
+                v = raw.get(k)
+                if isinstance(v, (str, int, float)):
+                    return str(v).strip()
+        elif isinstance(raw, str):
+            # Ex.: "{'mensagem': 'oi'}" ou '{"message":"oi"}'
+            m = re.search(r"(?:'mensagem'|\"mensagem\"|\"message\"|'message')\s*:\s*(['\"])(.*?)\1", raw)
+            if m:
+                return m.group(2).strip()
+            if raw.strip():
+                return raw.strip()
 
-    # 1) 'texto'
-    raw = body.get("texto")
-    if isinstance(raw, dict):
-        v = pick_from_dict(raw)
-        if v is not None:
-            return v
-    elif isinstance(raw, str):
-        # {'mensagem': '...'} ou {"message":"..."}
-        m = re.search(r"'mensagem'\s*:\s*'([^']*)'", raw) or re.search(r'"mensagem"\s*:\s*"([^"]*)"', raw)
-        if not m:
-            m = re.search(r"'message'\s*:\s*'([^']*)'", raw) or re.search(r'"message"\s*:\s*"([^"]*)"', raw)
-        if m:
-            return m.group(1).strip()
-        if raw.strip():
-            return raw.strip()
+    # 2) Templates “hidratadoTemplate”/“hydratedTemplate”
+    for tpl_key in ("hidratadoTemplate", "hydratedTemplate"):
+        tpl = body.get(tpl_key)
+        if isinstance(tpl, dict):
+            msg = tpl.get("message")
+            if isinstance(msg, (str, int, float)):
+                return str(msg).strip()
 
-    # 2) 'text'
-    raw2 = body.get("text")
-    if isinstance(raw2, dict):
-        v = pick_from_dict(raw2)
-        if v is not None:
-            return v
-    elif isinstance(raw2, str):
-        m = re.search(r"'mensagem'\s*:\s*'([^']*)'", raw2) or re.search(r'"mensagem"\s*:\s*"([^"]*)"', raw2)
-        if not m:
-            m = re.search(r"'message'\s*:\s*'([^']*)'", raw2) or re.search(r'"message"\s*:\s*"([^"]*)"', raw2)
-        if m:
-            return m.group(1).strip()
-        if raw2.strip():
-            return raw2.strip()
+    # 3) Mídias com legenda
+    img = body.get("image")
+    if isinstance(img, dict):
+        cap = img.get("caption")
+        if isinstance(cap, (str, int, float)):
+            return str(cap).strip()
 
-    # 3) Fallbacks simples
-    for key in ("message", "text", "body", "content", "msg"):
-        v = body.get(key)
+    # Documentos (algumas variantes colocam o doc em body['document'] ou em header->document)
+    doc = body.get("document") or (body.get("header") or {}).get("document")
+    if isinstance(doc, dict):
+        cap = doc.get("caption") or doc.get("title")
+        if isinstance(cap, (str, int, float)):
+            return str(cap).strip()
+
+    # 4) Fallbacks diretos
+    for k in ("mensagem", "message", "body", "content", "msg", "caption", "text"):
+        v = body.get(k)
         if isinstance(v, (str, int, float)):
             return str(v).strip()
 
+    # 5) Nada textual relevante
     return ""
 
 # ==============================
@@ -346,17 +340,17 @@ def continue_flow(phone: str, text: str) -> str:
         sess["stage"] = "ask_profile"
         return prefix + (
             "Qual é o seu *perfil*?\n"
-            "1) Representante\n"
-            "2) Cliente\n"
-            "3) Distribuidor\n"
+            "1) Cliente\n"
+            "2) Distribuidor\n"
+            "3) Representante\n"
             "4) Fornecedor de Produtos - Matéria Prima"
         )
 
     if sess["stage"] == "ask_profile":
         perfis = {
-            "1": "Representante",
-            "2": "Cliente",
-            "3": "Distribuidor",
+            "1": "Cliente",
+            "2": "Distribuidor",
+            "3": "Representantes",
             "4": "Fornecedor de Produtos - Matéria Prima",
         }
         data["perfil"] = perfis.get(tl, text.strip())
@@ -373,9 +367,9 @@ def continue_flow(phone: str, text: str) -> str:
         data["cnpj"] = (m.group(0) if m else re.sub(r"\D", "", text))
         sess["stage"] = "ask_endereco"
         label = (
-            "Informe o *endereço comercial* (Rua, número, bairro, cidade, UF, CEP)."
+            "Informe o *endereço comercial* (Rua, Número, Bairro, Cidade, UF, CEP)."
             if data.get("perfil", "").lower().startswith("represent")
-            else "Informe o *endereço* (Rua, número, bairro, cidade, UF, CEP)."
+            else "Informe o *endereço* (Rua, Número, Bairro, Cidade, UF, CEP)."
         )
         return prefix + label
 
@@ -504,7 +498,12 @@ async def receber(request: Request):
     # === NOVO: usa extração robusta ===
     texto = extract_incoming_text(body)
 
-    sender_name = body.get("senderName") or body.get("chatName") or ""
+    # Ignora eventos sem texto (áudio, imagem sem legenda, template sem mensagem, waitingMessage, etc.)
+    if not (texto or "").strip():
+        print("==> Sem texto extraído. Ignorando evento.")
+        return JSONResponse({"ok": True, "ignored": "noText"})
+
+    sender_name = body.get("senderName") or body.get("chatName") or body.get("nomeChat") or ""
     first_name = first_name_from_sender(sender_name)
     if first_name:
         KNOWN_NAMES[phone] = first_name
