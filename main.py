@@ -192,37 +192,67 @@ def generate_order_code(phone: str) -> str:
     short_phone = phone[-4:] if phone else "0000"
     return f"PED-{short_phone}-{date_str}-{str(len(SESSIONS) + 1).zfill(3)}"
 
-# -------- Extração robusta do texto recebido --------
+# -------- Extração ROBUSTA do texto recebido (PT/EN + mídia) --------
 def extract_incoming_text(body: dict) -> str:
     """
     Extrai o texto da mensagem de forma robusta:
-    - Se 'texto' for dict: usa 'mensagem'
-    - Se 'texto' for string parecida com JSON/dict: tenta regex para campo 'mensagem'
-    - Fallbacks: 'message', 'text', 'body', 'content', 'msg'
+    - PT:  body["texto"]["mensagem"]
+    - EN:  body["text"]["message"]
+    - Fallbacks: "message", "text", "body", "content", "msg"
+    - Mídia: image.caption, hydratedTemplate.message, etc.
+    - Strings que parecem dicts: tenta regex pelo campo mensagem/message
     """
-    raw = body.get("texto")
-
-    if isinstance(raw, dict):
-        v = raw.get("mensagem")
+    def _from_value(v):
+        # v pode ser str, int/float, dict
         if isinstance(v, (str, int, float)):
-            return str(v).strip()
+            s = str(v).strip()
+            if not s:
+                return ""
+            # Caso venha como string de dict "{'mensagem':'oi'}" / '{"message":"2"}'
+            m = re.search(r"(?:'mensagem'|\"mensagem\"|\bmensagem\b)\s*:\s*'([^']*)'", s)
+            if m: 
+                return m.group(1).strip()
+            m = re.search(r"(?:'message'|\"message\"|\bmessage\b)\s*:\s*\"([^\"]*)\"", s)
+            if m:
+                return m.group(1).strip()
+            return s
+        if isinstance(v, dict):
+            # Ordem de subchaves mais comuns
+            for sub in ("mensagem", "message", "caption", "text"):
+                if sub in v and isinstance(v[sub], (str, int, float)):
+                    return str(v[sub]).strip()
+        return ""
 
-    if isinstance(raw, str):
-        m = re.search(r"'mensagem'\s*:\s*'([^']*)'", raw)
-        if m:
-            return m.group(1).strip()
-        m = re.search(r'"mensagem"\s*:\s*"([^"]*)"', raw)
-        if m:
-            return m.group(1).strip()
-        if raw.strip():
-            return raw.strip()
+    # 1) Casos principais PT/EN
+    for key, sub in (("texto", "mensagem"), ("text", "message")):
+        if key in body and body[key] is not None:
+            v = body[key]
+            if isinstance(v, dict) and sub in v:
+                return _from_value(v[sub])
+            out = _from_value(v)
+            if out:
+                return out
 
+    # 2) Mídia com legenda/corpo
+    #    Ex.: body["image"]["caption"], body["hydratedTemplate"]["message"]
+    if isinstance(body.get("image"), dict):
+        out = _from_value(body["image"].get("caption", "")) or _from_value(body["image"].get("text", ""))
+        if out:
+            return out
+    if isinstance(body.get("hydratedTemplate"), dict):
+        out = _from_value(body["hydratedTemplate"].get("message", ""))
+        if out:
+            return out
+
+    # 3) Fallbacks diretos em nível de topo
     for key in ("message", "text", "body", "content", "msg"):
-        if body.get(key):
-            return str(body.get(key)).strip()
+        if key in body and body[key] is not None:
+            out = _from_value(body[key])
+            if out:
+                return out
 
-    # Áudio, imagem, template etc. sem texto -> vazio
     return ""
+
 
 # ==============================
 # PARSE DE ITENS (livre: “produto x2” etc.)
